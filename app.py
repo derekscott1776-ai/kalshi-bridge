@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CFBD_BASE = "https://api.collegefootballdata.com"
-CFBD_API_KEY = os.environ.get("CFBD_API_KEY")
+CFBD_API_KEY = os.environ.get("CFBD_API_KEY", "").strip()
 
 
 @app.get("/")
@@ -21,9 +21,9 @@ def home():
     )
 
 
-# -------------------------
+# ============================================================
 # KALSHI
-# -------------------------
+# ============================================================
 
 def kalshi_get(path, params=None):
     r = requests.get(
@@ -43,6 +43,7 @@ def get_event_markets(event_ticker):
             "limit": 1000
         }
     )
+
     return data.get("markets", [])
 
 
@@ -66,9 +67,28 @@ def compact_market(m):
     }
 
 
-# -------------------------
-# TEXT MATCHING
-# -------------------------
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def clamp_probability(value):
+    value = number(value)
+
+    if value is None:
+        return None
+
+    if value < 0 or value > 1:
+        return None
+
+    return value
+
 
 def normalize(text):
     text = str(text or "").lower()
@@ -78,6 +98,7 @@ def normalize(text):
         "st.": "state",
         "florida st": "florida state",
         "miami fl": "miami",
+        "miami (fl)": "miami",
         "university": "",
     }
 
@@ -85,7 +106,8 @@ def normalize(text):
         text = text.replace(old, new)
 
     return "".join(
-        c for c in text
+        c
+        for c in text
         if c.isalnum()
     )
 
@@ -95,7 +117,10 @@ def similarity(a, b):
     b = normalize(b)
 
     if not a or not b:
-        return 0
+        return 0.0
+
+    if a == b:
+        return 1.0
 
     if a in b or b in a:
         return 1.0
@@ -106,6 +131,25 @@ def similarity(a, b):
         b
     ).ratio()
 
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00"
+            )
+        )
+    except ValueError:
+        return None
+
+
+# ============================================================
+# KALSHI EVENT DISCOVERY
+# ============================================================
 
 def event_text(event):
     return " ".join([
@@ -118,17 +162,24 @@ def event_text(event):
 def matchup_score(event, team, opponent):
     text = event_text(event)
 
-    return (
-        similarity(team, text)
-        + similarity(opponent, text)
+    team_score = similarity(
+        team,
+        text
     )
 
+    opponent_score = similarity(
+        opponent,
+        text
+    )
 
-# -------------------------
-# KALSHI EVENT DISCOVERY
-# -------------------------
+    return team_score + opponent_score
 
-def discover_game_event(team, opponent, game_date):
+
+def discover_game_event(
+    team,
+    opponent,
+    game_date
+):
     date_obj = datetime.strptime(
         game_date,
         "%Y-%m-%d"
@@ -155,9 +206,15 @@ def discover_game_event(team, opponent, game_date):
             params=params
         )
 
-        for event in data.get("events", []):
+        for event in data.get(
+            "events",
+            []
+        ):
             event_ticker = str(
-                event.get("event_ticker", "")
+                event.get(
+                    "event_ticker",
+                    ""
+                )
             ).upper()
 
             if date_code not in event_ticker:
@@ -170,10 +227,15 @@ def discover_game_event(team, opponent, game_date):
             )
 
             candidates.append(
-                (score, event)
+                (
+                    score,
+                    event
+                )
             )
 
-        cursor = data.get("cursor")
+        cursor = data.get(
+            "cursor"
+        )
 
         if not cursor:
             break
@@ -186,7 +248,9 @@ def discover_game_event(team, opponent, game_date):
         reverse=True
     )
 
-    best_score, best_event = candidates[0]
+    best_score, best_event = (
+        candidates[0]
+    )
 
     if best_score < 1.0:
         return None
@@ -196,13 +260,18 @@ def discover_game_event(team, opponent, game_date):
     )
 
 
-def related_event_ticker(game_event, market_type):
+def related_event_ticker(
+    game_event,
+    market_type
+):
     if not game_event:
         return None
 
     prefix = "KXNCAAFGAME-"
 
-    if not game_event.startswith(prefix):
+    if not game_event.startswith(
+        prefix
+    ):
         return None
 
     suffix = game_event.split(
@@ -211,399 +280,17 @@ def related_event_ticker(game_event, market_type):
     )[1]
 
     if market_type == "spread":
-        return f"KXNCAAFSPREAD-{suffix}"
+        return (
+            f"KXNCAAFSPREAD-{suffix}"
+        )
 
     if market_type == "total":
-        return f"KXNCAAFTOTAL-{suffix}"
+        return (
+            f"KXNCAAFTOTAL-{suffix}"
+        )
 
     return game_event
 
-
-# -------------------------
-# CFBD PROBABILITY ENGINE
-# -------------------------
-
-def cfbd_get(path, params=None):
-    if not CFBD_API_KEY:
-        raise RuntimeError(
-            "CFBD_API_KEY is not configured"
-        )
-
-    r = requests.get(
-        f"{CFBD_BASE}{path}",
-        params=params,
-        headers={
-            "Authorization": (
-                f"Bearer {CFBD_API_KEY}"
-            )
-        },
-        timeout=20
-    )
-
-    r.raise_for_status()
-    return r.json()
-
-
-def get_team_elo(team, year):
-    data = cfbd_get(
-        "/ratings/elo",
-        params={
-            "year": year,
-            "team": team
-        }
-    )
-
-    if not data:
-        return None
-
-    best = None
-    best_score = -1
-
-    for row in data:
-        score = similarity(
-            team,
-            row.get("team")
-        )
-
-        if score > best_score:
-            best_score = score
-            best = row
-
-    if not best:
-        return None
-
-    elo = best.get("elo")
-
-    if elo is None:
-        return None
-
-    return {
-        "requested_team": team,
-        "matched_team": best.get("team"),
-        "conference": best.get("conference"),
-        "elo": float(elo)
-    }
-
-
-def elo_win_probability(
-    team_elo,
-    opponent_elo
-):
-    rating_difference = (
-        team_elo - opponent_elo
-    )
-
-    probability = (
-        1.0
-        / (
-            1.0
-            + math.pow(
-                10.0,
-                -rating_difference / 400.0
-            )
-        )
-    )
-
-    return probability
-
-
-def build_probability_model(
-    team,
-    opponent,
-    game_date
-):
-    year = datetime.strptime(
-        game_date,
-        "%Y-%m-%d"
-    ).year
-
-    team_rating = get_team_elo(
-        team,
-        year
-    )
-
-    opponent_rating = get_team_elo(
-        opponent,
-        year
-    )
-
-    if (
-        team_rating is None
-        or opponent_rating is None
-    ):
-        return {
-            "available": False,
-            "model": "CFBD Elo baseline",
-            "reason": (
-                "Could not retrieve an Elo "
-                "rating for both teams."
-            )
-        }
-
-    team_probability = elo_win_probability(
-        team_rating["elo"],
-        opponent_rating["elo"]
-    )
-
-    opponent_probability = (
-        1.0 - team_probability
-    )
-
-    return {
-        "available": True,
-        "model": "CFBD Elo baseline",
-        "season": year,
-        "team": team_rating,
-        "opponent": opponent_rating,
-        "rating_difference": round(
-            team_rating["elo"]
-            - opponent_rating["elo"],
-            2
-        ),
-        "team_fair_probability": round(
-            team_probability,
-            6
-        ),
-        "opponent_fair_probability": round(
-            opponent_probability,
-            6
-        ),
-        "team_fair_probability_percent": round(
-            team_probability * 100,
-            2
-        ),
-        "opponent_fair_probability_percent": round(
-            opponent_probability * 100,
-            2
-        ),
-        "notes": (
-            "Baseline independent probability "
-            "derived only from CFBD Elo ratings. "
-            "Kalshi prices are not inputs."
-        )
-    }
-
-
-# -------------------------
-# VALUE / EV MATH
-# -------------------------
-
-def number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def clamp_probability(value):
-    value = number(value)
-
-    if value is None:
-        return None
-
-    if value < 0 or value > 1:
-        return None
-
-    return value
-
-
-def expected_metrics(
-    fair_probability,
-    entry_price
-):
-    fair_probability = clamp_probability(
-        fair_probability
-    )
-
-    entry_price = number(
-        entry_price
-    )
-
-    if fair_probability is None:
-        return None
-
-    if entry_price is None:
-        return None
-
-    if entry_price <= 0 or entry_price >= 1:
-        return None
-
-    edge = (
-        fair_probability
-        - entry_price
-    )
-
-    expected_roi = (
-        edge / entry_price
-    )
-
-    return {
-        "fair_probability": round(
-            fair_probability,
-            4
-        ),
-        "entry_price": round(
-            entry_price,
-            4
-        ),
-        "edge": round(
-            edge,
-            4
-        ),
-        "edge_percentage_points": round(
-            edge * 100,
-            2
-        ),
-        "expected_profit_per_contract": round(
-            edge,
-            4
-        ),
-        "expected_roi": round(
-            expected_roi,
-            4
-        ),
-        "expected_roi_percent": round(
-            expected_roi * 100,
-            2
-        )
-    }
-
-
-def analysis_market(
-    m,
-    market_type,
-    fair_yes_probability=None
-):
-    yes_bid = number(
-        m.get("yes_bid_dollars")
-    )
-
-    yes_ask = number(
-        m.get("yes_ask_dollars")
-    )
-
-    no_bid = number(
-        m.get("no_bid_dollars")
-    )
-
-    no_ask = number(
-        m.get("no_ask_dollars")
-    )
-
-    last_price = number(
-        m.get("last_price_dollars")
-    )
-
-    volume = number(
-        m.get("volume_fp")
-    )
-
-    volume_24h = number(
-        m.get("volume_24h_fp")
-    )
-
-    open_interest = number(
-        m.get("open_interest_fp")
-    )
-
-    yes_spread = None
-
-    if (
-        yes_bid is not None
-        and yes_ask is not None
-    ):
-        yes_spread = round(
-            yes_ask - yes_bid,
-            4
-        )
-
-    fair_yes = clamp_probability(
-        fair_yes_probability
-    )
-
-    fair_no = (
-        1.0 - fair_yes
-        if fair_yes is not None
-        else None
-    )
-
-    return {
-        "market_type": market_type,
-        "ticker": m.get("ticker"),
-        "title": m.get("title"),
-        "yes_bid": yes_bid,
-        "yes_ask": yes_ask,
-        "no_bid": no_bid,
-        "no_ask": no_ask,
-        "last_price": last_price,
-        "yes_bid_ask_spread": yes_spread,
-        "volume": volume,
-        "volume_24h": volume_24h,
-        "open_interest": open_interest,
-        "close_time": m.get("close_time"),
-        "fair_probability_supplied": (
-            fair_yes is not None
-        ),
-        "yes_evaluation": expected_metrics(
-            fair_yes,
-            yes_ask
-        ),
-        "no_evaluation": expected_metrics(
-            fair_no,
-            no_ask
-        )
-    }
-
-
-def analysis_candidates(
-    markets,
-    market_type,
-    fair_probabilities=None
-):
-    fair_probabilities = (
-        fair_probabilities or {}
-    )
-
-    results = []
-
-    for m in markets:
-        ticker = m.get("ticker")
-
-        item = analysis_market(
-            m,
-            market_type,
-            fair_probabilities.get(ticker)
-        )
-
-        if (
-            item["yes_ask"] is None
-            and item["no_ask"] is None
-        ):
-            continue
-
-        results.append(item)
-
-    results.sort(
-        key=lambda x: (
-            -(
-                x["volume_24h"]
-                if x["volume_24h"] is not None
-                else 0
-            ),
-            (
-                x["yes_bid_ask_spread"]
-                if x["yes_bid_ask_spread"] is not None
-                else 999
-            )
-        )
-    )
-
-    return results
-
-
-# -------------------------
-# GAME DATA
-# -------------------------
 
 def build_game_data(
     team,
@@ -616,29 +303,42 @@ def build_game_data(
         game_date
     )
 
-    spread_event = related_event_ticker(
-        game_event,
-        "spread"
+    spread_event = (
+        related_event_ticker(
+            game_event,
+            "spread"
+        )
     )
 
-    total_event = related_event_ticker(
-        game_event,
-        "total"
+    total_event = (
+        related_event_ticker(
+            game_event,
+            "total"
+        )
     )
 
     game_winner = (
-        get_event_markets(game_event)
-        if game_event else []
+        get_event_markets(
+            game_event
+        )
+        if game_event
+        else []
     )
 
-    spreads = (
-        get_event_markets(spread_event)
-        if spread_event else []
+    spread = (
+        get_event_markets(
+            spread_event
+        )
+        if spread_event
+        else []
     )
 
-    totals = (
-        get_event_markets(total_event)
-        if total_event else []
+    total = (
+        get_event_markets(
+            total_event
+        )
+        if total_event
+        else []
     )
 
     return {
@@ -646,35 +346,909 @@ def build_game_data(
         "spread_event": spread_event,
         "total_event": total_event,
         "game_winner": game_winner,
-        "spread": spreads,
-        "total": totals
+        "spread": spread,
+        "total": total
     }
 
 
-def validate_values(
+# ============================================================
+# CFBD
+# ============================================================
+
+def cfbd_get(path, params=None):
+    if not CFBD_API_KEY:
+        raise RuntimeError(
+            "CFBD_API_KEY is not configured"
+        )
+
+    r = requests.get(
+        f"{CFBD_BASE}{path}",
+        params=params,
+        headers={
+            "Authorization":
+                f"Bearer {CFBD_API_KEY}"
+        },
+        timeout=20
+    )
+
+    r.raise_for_status()
+
+    return r.json()
+
+
+def game_pair_score(
+    game,
+    team,
+    opponent
+):
+    home_team = str(
+        game.get(
+            "homeTeam",
+            ""
+        )
+    )
+
+    away_team = str(
+        game.get(
+            "awayTeam",
+            ""
+        )
+    )
+
+    team_home = similarity(
+        team,
+        home_team
+    )
+
+    team_away = similarity(
+        team,
+        away_team
+    )
+
+    opponent_home = similarity(
+        opponent,
+        home_team
+    )
+
+    opponent_away = similarity(
+        opponent,
+        away_team
+    )
+
+    orientation_one = (
+        team_home
+        + opponent_away
+    )
+
+    orientation_two = (
+        team_away
+        + opponent_home
+    )
+
+    best_orientation = max(
+        orientation_one,
+        orientation_two
+    )
+
+    best_team_match = max(
+        team_home,
+        team_away
+    )
+
+    best_opponent_match = max(
+        opponent_home,
+        opponent_away
+    )
+
+    return {
+        "score": best_orientation,
+        "team_match": best_team_match,
+        "opponent_match":
+            best_opponent_match
+    }
+
+
+def discover_cfbd_game(
     team,
     opponent,
     game_date
 ):
-    if not team or not opponent or not game_date:
-        return (
-            False,
-            "Provide team, opponent, and date."
-        )
-
-    try:
+    requested_date = (
         datetime.strptime(
             game_date,
             "%Y-%m-%d"
+        ).date()
+    )
+
+    year = requested_date.year
+
+    searches = [
+        {
+            "year": year,
+            "team": team,
+            "seasonType": "both"
+        },
+        {
+            "year": year,
+            "team": opponent,
+            "seasonType": "both"
+        }
+    ]
+
+    seen_ids = set()
+    games = []
+
+    for params in searches:
+        data = cfbd_get(
+            "/games",
+            params=params
         )
 
-    except ValueError:
-        return (
+        for game in data:
+            game_id = game.get(
+                "id"
+            )
+
+            if game_id in seen_ids:
+                continue
+
+            seen_ids.add(
+                game_id
+            )
+
+            games.append(
+                game
+            )
+
+    # Fallback for a naming mismatch
+    if not games:
+        games = cfbd_get(
+            "/games",
+            params={
+                "year": year,
+                "seasonType": "both"
+            }
+        )
+
+    candidates = []
+
+    for game in games:
+        pair = game_pair_score(
+            game,
+            team,
+            opponent
+        )
+
+        if (
+            pair["team_match"] < 0.65
+            or
+            pair["opponent_match"] < 0.65
+        ):
+            continue
+
+        start_dt = (
+            parse_iso_datetime(
+                game.get(
+                    "startDate"
+                )
+            )
+        )
+
+        if start_dt is None:
+            continue
+
+        date_difference = abs(
+            (
+                start_dt.date()
+                - requested_date
+            ).days
+        )
+
+        # UTC date can differ from
+        # the US local game date by one day.
+        if date_difference > 1:
+            continue
+
+        adjusted_score = (
+            pair["score"]
+            - (
+                date_difference
+                * 0.05
+            )
+        )
+
+        candidates.append({
+            "score":
+                adjusted_score,
+            "game":
+                game
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x:
+            x["score"],
+        reverse=True
+    )
+
+    return candidates[0][
+        "game"
+    ]
+
+
+def build_cfbd_game_context(
+    team,
+    opponent,
+    game_date
+):
+    game = discover_cfbd_game(
+        team,
+        opponent,
+        game_date
+    )
+
+    if not game:
+        return {
+            "available": False,
+            "reason":
+                "No matching CFBD game found."
+        }
+
+    home_team = str(
+        game.get(
+            "homeTeam",
+            ""
+        )
+    )
+
+    away_team = str(
+        game.get(
+            "awayTeam",
+            ""
+        )
+    )
+
+    team_home_score = similarity(
+        team,
+        home_team
+    )
+
+    team_away_score = similarity(
+        team,
+        away_team
+    )
+
+    if (
+        team_home_score
+        >= team_away_score
+    ):
+        team_side = "home"
+        opponent_side = "away"
+
+        team_cfbd_name = (
+            home_team
+        )
+
+        opponent_cfbd_name = (
+            away_team
+        )
+
+        team_pregame_elo = number(
+            game.get(
+                "homePregameElo"
+            )
+        )
+
+        opponent_pregame_elo = number(
+            game.get(
+                "awayPregameElo"
+            )
+        )
+
+    else:
+        team_side = "away"
+        opponent_side = "home"
+
+        team_cfbd_name = (
+            away_team
+        )
+
+        opponent_cfbd_name = (
+            home_team
+        )
+
+        team_pregame_elo = number(
+            game.get(
+                "awayPregameElo"
+            )
+        )
+
+        opponent_pregame_elo = number(
+            game.get(
+                "homePregameElo"
+            )
+        )
+
+    return {
+        "available": True,
+
+        "game_id":
+            game.get("id"),
+
+        "season":
+            game.get("season"),
+
+        "week":
+            game.get("week"),
+
+        "season_type":
+            game.get(
+                "seasonType"
+            ),
+
+        "start_date":
+            game.get(
+                "startDate"
+            ),
+
+        "neutral_site":
+            bool(
+                game.get(
+                    "neutralSite"
+                )
+            ),
+
+        "venue_id":
+            game.get(
+                "venueId"
+            ),
+
+        "venue":
+            game.get(
+                "venue"
+            ),
+
+        "home_team":
+            home_team,
+
+        "away_team":
+            away_team,
+
+        "home_conference":
+            game.get(
+                "homeConference"
+            ),
+
+        "away_conference":
+            game.get(
+                "awayConference"
+            ),
+
+        "team_requested":
+            team,
+
+        "team_cfbd_name":
+            team_cfbd_name,
+
+        "team_home_away":
+            team_side,
+
+        "team_pregame_elo":
+            team_pregame_elo,
+
+        "opponent_requested":
+            opponent,
+
+        "opponent_cfbd_name":
+            opponent_cfbd_name,
+
+        "opponent_home_away":
+            opponent_side,
+
+        "opponent_pregame_elo":
+            opponent_pregame_elo,
+
+        "raw_home_pregame_elo":
+            number(
+                game.get(
+                    "homePregameElo"
+                )
+            ),
+
+        "raw_away_pregame_elo":
+            number(
+                game.get(
+                    "awayPregameElo"
+                )
+            )
+    }
+
+
+# ============================================================
+# ELO MODEL
+# ============================================================
+
+def elo_probability(
+    rating_difference
+):
+    return (
+        1.0
+        /
+        (
+            1.0
+            + math.pow(
+                10.0,
+                -rating_difference
+                / 400.0
+            )
+        )
+    )
+
+
+def build_probability_model(
+    team,
+    opponent,
+    game_date
+):
+    context = (
+        build_cfbd_game_context(
+            team,
+            opponent,
+            game_date
+        )
+    )
+
+    if not context.get(
+        "available"
+    ):
+        return {
+            "available": False,
+            "model":
+                "CFBD pregame Elo baseline",
+            "reason":
+                context.get(
+                    "reason"
+                )
+        }
+
+    team_elo = (
+        context.get(
+            "team_pregame_elo"
+        )
+    )
+
+    opponent_elo = (
+        context.get(
+            "opponent_pregame_elo"
+        )
+    )
+
+    if (
+        team_elo is None
+        or
+        opponent_elo is None
+    ):
+        return {
+            "available": False,
+
+            "model":
+                "CFBD pregame Elo baseline",
+
+            "reason":
+                "The matching game does not "
+                "currently contain both "
+                "pregame Elo ratings.",
+
+            "game_context":
+                context
+        }
+
+    raw_rating_difference = (
+        team_elo
+        - opponent_elo
+    )
+
+    # IMPORTANT:
+    #
+    # We now know whether the selected
+    # team is home, away, or playing
+    # at a neutral site.
+    #
+    # But we have NOT yet historically
+    # calibrated how many Elo points
+    # home field should be worth.
+    #
+    # Therefore the location adjustment
+    # remains zero rather than using an
+    # invented value.
+
+    home_field_adjustment = 0.0
+
+    adjusted_rating_difference = (
+        raw_rating_difference
+        + home_field_adjustment
+    )
+
+    team_probability = (
+        elo_probability(
+            adjusted_rating_difference
+        )
+    )
+
+    opponent_probability = (
+        1.0
+        - team_probability
+    )
+
+    return {
+        "available": True,
+
+        "model":
+            "CFBD pregame Elo baseline",
+
+        "model_version":
+            "cfbd-pregame-elo-v2",
+
+        "game_context":
+            context,
+
+        "team_pregame_elo":
+            team_elo,
+
+        "opponent_pregame_elo":
+            opponent_elo,
+
+        "raw_rating_difference":
+            round(
+                raw_rating_difference,
+                2
+            ),
+
+        "home_field_adjustment_elo_points":
+            home_field_adjustment,
+
+        "home_field_adjustment_calibrated":
             False,
-            "Date must use YYYY-MM-DD format"
+
+        "home_field_adjustment_status":
+            (
+                "Venue and home/away data "
+                "are known, but no arbitrary "
+                "home-field Elo adjustment "
+                "is applied. Historical "
+                "calibration is the next step."
+            ),
+
+        "adjusted_rating_difference":
+            round(
+                adjusted_rating_difference,
+                2
+            ),
+
+        "team_fair_probability":
+            round(
+                team_probability,
+                6
+            ),
+
+        "team_fair_probability_percent":
+            round(
+                team_probability
+                * 100,
+                2
+            ),
+
+        "opponent_fair_probability":
+            round(
+                opponent_probability,
+                6
+            ),
+
+        "opponent_fair_probability_percent":
+            round(
+                opponent_probability
+                * 100,
+                2
+            ),
+
+        "notes":
+            (
+                "Fair probability uses the "
+                "matching CFBD game's pregame "
+                "Elo ratings. Kalshi prices "
+                "are not inputs to the model."
+            )
+    }
+
+
+# ============================================================
+# EDGE / EV / ROI
+# ============================================================
+
+def expected_metrics(
+    fair_probability,
+    entry_price
+):
+    fair_probability = (
+        clamp_probability(
+            fair_probability
+        )
+    )
+
+    entry_price = number(
+        entry_price
+    )
+
+    if fair_probability is None:
+        return None
+
+    if entry_price is None:
+        return None
+
+    if (
+        entry_price <= 0
+        or
+        entry_price >= 1
+    ):
+        return None
+
+    edge = (
+        fair_probability
+        - entry_price
+    )
+
+    expected_profit = edge
+
+    expected_roi = (
+        expected_profit
+        / entry_price
+    )
+
+    return {
+        "fair_probability":
+            round(
+                fair_probability,
+                4
+            ),
+
+        "entry_price":
+            round(
+                entry_price,
+                4
+            ),
+
+        "edge":
+            round(
+                edge,
+                4
+            ),
+
+        "edge_percentage_points":
+            round(
+                edge * 100,
+                2
+            ),
+
+        "expected_profit_per_contract":
+            round(
+                expected_profit,
+                4
+            ),
+
+        "expected_roi":
+            round(
+                expected_roi,
+                4
+            ),
+
+        "expected_roi_percent":
+            round(
+                expected_roi
+                * 100,
+                2
+            )
+    }
+
+
+def analysis_market(
+    m,
+    market_type,
+    fair_yes_probability=None
+):
+    yes_bid = number(
+        m.get(
+            "yes_bid_dollars"
+        )
+    )
+
+    yes_ask = number(
+        m.get(
+            "yes_ask_dollars"
+        )
+    )
+
+    no_bid = number(
+        m.get(
+            "no_bid_dollars"
+        )
+    )
+
+    no_ask = number(
+        m.get(
+            "no_ask_dollars"
+        )
+    )
+
+    last_price = number(
+        m.get(
+            "last_price_dollars"
+        )
+    )
+
+    volume = number(
+        m.get(
+            "volume_fp"
+        )
+    )
+
+    volume_24h = number(
+        m.get(
+            "volume_24h_fp"
+        )
+    )
+
+    open_interest = number(
+        m.get(
+            "open_interest_fp"
+        )
+    )
+
+    yes_spread = None
+
+    if (
+        yes_bid is not None
+        and
+        yes_ask is not None
+    ):
+        yes_spread = round(
+            yes_ask
+            - yes_bid,
+            4
         )
 
-    return True, None
+    fair_yes = (
+        clamp_probability(
+            fair_yes_probability
+        )
+    )
+
+    fair_no = (
+        1.0 - fair_yes
+        if fair_yes is not None
+        else None
+    )
+
+    return {
+        "market_type":
+            market_type,
+
+        "ticker":
+            m.get("ticker"),
+
+        "title":
+            m.get("title"),
+
+        "yes_bid":
+            yes_bid,
+
+        "yes_ask":
+            yes_ask,
+
+        "no_bid":
+            no_bid,
+
+        "no_ask":
+            no_ask,
+
+        "last_price":
+            last_price,
+
+        "yes_bid_ask_spread":
+            yes_spread,
+
+        "volume":
+            volume,
+
+        "volume_24h":
+            volume_24h,
+
+        "open_interest":
+            open_interest,
+
+        "close_time":
+            m.get(
+                "close_time"
+            ),
+
+        "fair_probability_supplied":
+            fair_yes is not None,
+
+        "yes_evaluation":
+            expected_metrics(
+                fair_yes,
+                yes_ask
+            ),
+
+        "no_evaluation":
+            expected_metrics(
+                fair_no,
+                no_ask
+            )
+    }
+
+
+def analysis_candidates(
+    markets,
+    market_type,
+    fair_probabilities=None
+):
+    fair_probabilities = (
+        fair_probabilities
+        or {}
+    )
+
+    results = []
+
+    for m in markets:
+        ticker = m.get(
+            "ticker"
+        )
+
+        item = analysis_market(
+            m,
+            market_type,
+            fair_probabilities.get(
+                ticker
+            )
+        )
+
+        if (
+            item["yes_ask"] is None
+            and
+            item["no_ask"] is None
+        ):
+            continue
+
+        results.append(
+            item
+        )
+
+    results.sort(
+        key=lambda x: (
+            -(
+                x["volume_24h"]
+                if
+                x["volume_24h"]
+                is not None
+                else 0
+            ),
+            (
+                x[
+                    "yes_bid_ask_spread"
+                ]
+                if
+                x[
+                    "yes_bid_ask_spread"
+                ]
+                is not None
+                else 999
+            )
+        )
+    )
+
+    return results
 
 
 def find_winner_fair_probabilities(
@@ -703,9 +1277,15 @@ def find_winner_fair_probabilities(
     )
 
     for market in markets:
-        ticker = market.get("ticker")
+        ticker = market.get(
+            "ticker"
+        )
+
         title = str(
-            market.get("title", "")
+            market.get(
+                "title",
+                ""
+            )
         )
 
         team_score = similarity(
@@ -720,26 +1300,66 @@ def find_winner_fair_probabilities(
 
         if (
             team_score >= 0.75
-            and team_score > opponent_score
+            and
+            team_score
+            > opponent_score
         ):
-            probabilities[ticker] = (
-                team_probability
-            )
+            probabilities[
+                ticker
+            ] = team_probability
 
         elif (
             opponent_score >= 0.75
-            and opponent_score > team_score
+            and
+            opponent_score
+            > team_score
         ):
-            probabilities[ticker] = (
-                opponent_probability
-            )
+            probabilities[
+                ticker
+            ] = opponent_probability
 
     return probabilities
 
 
-# -------------------------
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_values(
+    team,
+    opponent,
+    game_date
+):
+    if (
+        not team
+        or
+        not opponent
+        or
+        not game_date
+    ):
+        return (
+            False,
+            "Provide team, opponent, and date."
+        )
+
+    try:
+        datetime.strptime(
+            game_date,
+            "%Y-%m-%d"
+        )
+
+    except ValueError:
+        return (
+            False,
+            "Date must use YYYY-MM-DD format"
+        )
+
+    return True, None
+
+
+# ============================================================
 # ROUTES
-# -------------------------
+# ============================================================
 
 @app.get("/market/<ticker>")
 def market(ticker):
@@ -761,7 +1381,9 @@ def cfbd_test():
     if not CFBD_API_KEY:
         return jsonify(
             configured=False,
-            error="CFBD_API_KEY is missing"
+            error=(
+                "CFBD_API_KEY is missing"
+            )
         ), 500
 
     try:
@@ -779,7 +1401,8 @@ def cfbd_test():
             records=len(data),
             sample=(
                 data[0]
-                if data else None
+                if data
+                else None
             )
         )
 
@@ -787,6 +1410,64 @@ def cfbd_test():
         return jsonify(
             configured=True,
             success=False,
+            error=str(e)
+        ), 502
+
+
+@app.get("/cfbd-game")
+def cfbd_game():
+    team = request.args.get(
+        "team",
+        ""
+    ).strip()
+
+    opponent = request.args.get(
+        "opponent",
+        ""
+    ).strip()
+
+    game_date = request.args.get(
+        "date",
+        ""
+    ).strip()
+
+    valid, message = (
+        validate_values(
+            team,
+            opponent,
+            game_date
+        )
+    )
+
+    if not valid:
+        return jsonify(
+            error=message
+        ), 400
+
+    try:
+        context = (
+            build_cfbd_game_context(
+                team,
+                opponent,
+                game_date
+            )
+        )
+
+        return jsonify(
+            matchup=(
+                f"{team} vs {opponent}"
+            ),
+            date=game_date,
+            cfbd_game=context
+        )
+
+    except RuntimeError as e:
+        return jsonify(
+            error=str(e)
+        ), 500
+
+    except requests.RequestException as e:
+        return jsonify(
             error=str(e)
         ), 502
 
@@ -808,10 +1489,12 @@ def game():
         ""
     ).strip()
 
-    valid, message = validate_values(
-        team,
-        opponent,
-        game_date
+    valid, message = (
+        validate_values(
+            team,
+            opponent,
+            game_date
+        )
     )
 
     if not valid:
@@ -827,24 +1510,51 @@ def game():
         )
 
         return jsonify(
-            matchup=f"{team} vs {opponent}",
+            matchup=(
+                f"{team} vs {opponent}"
+            ),
+
             date=game_date,
+
             event_tickers={
-                "game": data["game_event"],
-                "spread": data["spread_event"],
-                "total": data["total_event"]
+                "game":
+                    data[
+                        "game_event"
+                    ],
+
+                "spread":
+                    data[
+                        "spread_event"
+                    ],
+
+                "total":
+                    data[
+                        "total_event"
+                    ]
             },
+
             game_winner=[
                 compact_market(m)
-                for m in data["game_winner"]
+                for m
+                in data[
+                    "game_winner"
+                ]
             ],
+
             spread=[
                 compact_market(m)
-                for m in data["spread"]
+                for m
+                in data[
+                    "spread"
+                ]
             ],
+
             total=[
                 compact_market(m)
-                for m in data["total"]
+                for m
+                in data[
+                    "total"
+                ]
             ]
         )
 
@@ -871,10 +1581,12 @@ def analyze():
         ""
     ).strip()
 
-    valid, message = validate_values(
-        team,
-        opponent,
-        game_date
+    valid, message = (
+        validate_values(
+            team,
+            opponent,
+            game_date
+        )
     )
 
     if not valid:
@@ -889,14 +1601,20 @@ def analyze():
             game_date
         )
 
-        if not data["game_event"]:
+        if not data[
+            "game_event"
+        ]:
             return jsonify(
                 found=False,
-                matchup=f"{team} vs {opponent}",
+                matchup=(
+                    f"{team} vs "
+                    f"{opponent}"
+                ),
                 date=game_date,
                 message=(
                     "No matching Kalshi "
-                    "college football event found."
+                    "college football "
+                    "event found."
                 )
             ), 404
 
@@ -910,7 +1628,9 @@ def analyze():
 
         winner_probabilities = (
             find_winner_fair_probabilities(
-                data["game_winner"],
+                data[
+                    "game_winner"
+                ],
                 team,
                 opponent,
                 probability_model
@@ -919,7 +1639,9 @@ def analyze():
 
         winner_candidates = (
             analysis_candidates(
-                data["game_winner"],
+                data[
+                    "game_winner"
+                ],
                 "winner",
                 winner_probabilities
             )
@@ -927,78 +1649,144 @@ def analyze():
 
         spread_candidates = (
             analysis_candidates(
-                data["spread"],
+                data[
+                    "spread"
+                ],
                 "spread"
             )
         )
 
         total_candidates = (
             analysis_candidates(
-                data["total"],
+                data[
+                    "total"
+                ],
                 "total"
             )
         )
 
         return jsonify(
             found=True,
-            matchup=f"{team} vs {opponent}",
+
+            matchup=(
+                f"{team} vs {opponent}"
+            ),
+
             date=game_date,
+
             probability_model=(
                 probability_model
             ),
+
             methodology={
-                "probability_source": (
-                    "Independent CFBD Elo "
-                    "ratings."
-                ),
-                "kalshi_role": (
-                    "Kalshi prices are used "
-                    "only after fair probability "
-                    "is calculated."
-                ),
-                "edge": (
-                    "Independent fair probability "
-                    "minus executable ask price."
-                ),
-                "expected_profit": (
-                    "Fair probability minus "
-                    "contract cost."
-                ),
-                "expected_roi": (
-                    "Expected profit divided "
-                    "by contract cost."
-                ),
-                "limitations": (
-                    "Version 1 is an Elo-only "
-                    "baseline. It does not yet "
-                    "adjust for venue, injuries, "
-                    "weather, matchup efficiency, "
-                    "roster changes, fees, or "
-                    "slippage."
-                )
+                "probability_source":
+                    (
+                        "Exact CFBD game "
+                        "pregame Elo ratings."
+                    ),
+
+                "game_context":
+                    (
+                        "CFBD supplies week, "
+                        "home team, away team, "
+                        "venue and neutral-site "
+                        "status."
+                    ),
+
+                "home_field":
+                    (
+                        "Location is identified "
+                        "but the home-field Elo "
+                        "coefficient is currently "
+                        "zero until historical "
+                        "calibration is completed."
+                    ),
+
+                "kalshi_role":
+                    (
+                        "Kalshi prices are used "
+                        "only after independent "
+                        "fair probability is "
+                        "calculated."
+                    ),
+
+                "edge":
+                    (
+                        "Independent fair "
+                        "probability minus "
+                        "executable ask price."
+                    ),
+
+                "expected_profit":
+                    (
+                        "Fair probability minus "
+                        "contract cost."
+                    ),
+
+                "expected_roi":
+                    (
+                        "Expected profit divided "
+                        "by contract cost."
+                    ),
+
+                "limitations":
+                    (
+                        "Fees, slippage, injuries, "
+                        "weather, matchup "
+                        "efficiency, roster "
+                        "changes and a calibrated "
+                        "home-field coefficient "
+                        "are not yet included."
+                    )
             },
+
             event_tickers={
-                "game": data["game_event"],
-                "spread": data["spread_event"],
-                "total": data["total_event"]
+                "game":
+                    data[
+                        "game_event"
+                    ],
+
+                "spread":
+                    data[
+                        "spread_event"
+                    ],
+
+                "total":
+                    data[
+                        "total_event"
+                    ]
             },
+
             summary={
-                "winner_contracts": len(
-                    winner_candidates
-                ),
-                "spread_contracts": len(
-                    spread_candidates
-                ),
-                "total_contracts": len(
-                    total_candidates
-                ),
-                "winner_contracts_with_model": (
-                    len(winner_probabilities)
-                )
+                "winner_contracts":
+                    len(
+                        winner_candidates
+                    ),
+
+                "spread_contracts":
+                    len(
+                        spread_candidates
+                    ),
+
+                "total_contracts":
+                    len(
+                        total_candidates
+                    ),
+
+                "winner_contracts_with_model":
+                    len(
+                        winner_probabilities
+                    )
             },
-            winner=winner_candidates,
-            spread=spread_candidates,
-            total=total_candidates
+
+            winner=
+                winner_candidates,
+
+            spread=
+                spread_candidates,
+
+            total=
+                total_candidates
         )
 
     except RuntimeError as e:
@@ -1028,23 +1816,32 @@ def smu_today():
         )
 
         return jsonify(
-            matchup="SMU vs Florida State",
+            matchup=(
+                "SMU vs Florida State"
+            ),
+
             date="2026-09-07",
+
             game_winner=[
                 compact_market(m)
-                for m in get_event_markets(
+                for m
+                in get_event_markets(
                     game_event
                 )
             ],
+
             spread=[
                 compact_market(m)
-                for m in get_event_markets(
+                for m
+                in get_event_markets(
                     spread_event
                 )
             ],
+
             total=[
                 compact_market(m)
-                for m in get_event_markets(
+                for m
+                in get_event_markets(
                     total_event
                 )
             ]
