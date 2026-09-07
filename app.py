@@ -63,7 +63,6 @@ def normalize(text):
     replacements = {
         "&": " and ",
         "st.": "state",
-        "st ": "state ",
         "florida st": "florida state",
         "miami fl": "miami",
         "university": "",
@@ -217,7 +216,79 @@ def number(value):
         return None
 
 
-def analysis_market(m, market_type):
+def clamp_probability(value):
+    value = number(value)
+
+    if value is None:
+        return None
+
+    if value < 0 or value > 1:
+        return None
+
+    return value
+
+
+def expected_metrics(fair_probability, entry_price):
+    fair_probability = clamp_probability(
+        fair_probability
+    )
+
+    entry_price = number(
+        entry_price
+    )
+
+    if fair_probability is None:
+        return None
+
+    if entry_price is None:
+        return None
+
+    if entry_price <= 0 or entry_price >= 1:
+        return None
+
+    edge = fair_probability - entry_price
+
+    expected_profit_per_contract = edge
+
+    expected_roi = edge / entry_price
+
+    return {
+        "fair_probability": round(
+            fair_probability,
+            4
+        ),
+        "market_probability": round(
+            entry_price,
+            4
+        ),
+        "edge": round(
+            edge,
+            4
+        ),
+        "edge_percentage_points": round(
+            edge * 100,
+            2
+        ),
+        "expected_profit_per_contract": round(
+            expected_profit_per_contract,
+            4
+        ),
+        "expected_roi": round(
+            expected_roi,
+            4
+        ),
+        "expected_roi_percent": round(
+            expected_roi * 100,
+            2
+        )
+    }
+
+
+def analysis_market(
+    m,
+    market_type,
+    fair_yes_probability=None
+):
     yes_bid = number(
         m.get("yes_bid_dollars")
     )
@@ -261,6 +332,26 @@ def analysis_market(m, market_type):
             4
         )
 
+    fair_yes = clamp_probability(
+        fair_yes_probability
+    )
+
+    fair_no = (
+        round(1 - fair_yes, 6)
+        if fair_yes is not None
+        else None
+    )
+
+    yes_evaluation = expected_metrics(
+        fair_yes,
+        yes_ask
+    )
+
+    no_evaluation = expected_metrics(
+        fair_no,
+        no_ask
+    )
+
     return {
         "market_type": market_type,
         "ticker": m.get("ticker"),
@@ -274,17 +365,37 @@ def analysis_market(m, market_type):
         "volume": volume,
         "volume_24h": volume_24h,
         "open_interest": open_interest,
-        "close_time": m.get("close_time")
+        "close_time": m.get("close_time"),
+        "fair_probability_supplied": (
+            fair_yes is not None
+        ),
+        "yes_evaluation": yes_evaluation,
+        "no_evaluation": no_evaluation
     }
 
 
-def analysis_candidates(markets, market_type):
+def analysis_candidates(
+    markets,
+    market_type,
+    fair_probabilities=None
+):
+    fair_probabilities = (
+        fair_probabilities or {}
+    )
+
     results = []
 
     for m in markets:
+        ticker = m.get("ticker")
+
+        fair_yes = fair_probabilities.get(
+            ticker
+        )
+
         item = analysis_market(
             m,
-            market_type
+            market_type,
+            fair_yes
         )
 
         if (
@@ -355,7 +466,65 @@ def build_game_data(team, opponent, game_date):
     }
 
 
-def validate_game_request():
+def validate_values(team, opponent, game_date):
+    if not team or not opponent or not game_date:
+        return (
+            False,
+            "Provide team, opponent, and date."
+        )
+
+    try:
+        datetime.strptime(
+            game_date,
+            "%Y-%m-%d"
+        )
+    except ValueError:
+        return (
+            False,
+            "Date must use YYYY-MM-DD format"
+        )
+
+    return True, None
+
+
+def read_analyze_request():
+    if request.method == "POST":
+        payload = request.get_json(
+            silent=True
+        ) or {}
+
+        team = str(
+            payload.get("team", "")
+        ).strip()
+
+        opponent = str(
+            payload.get("opponent", "")
+        ).strip()
+
+        game_date = str(
+            payload.get("date", "")
+        ).strip()
+
+        fair_probabilities = (
+            payload.get(
+                "fair_probabilities",
+                {}
+            )
+        )
+
+        if not isinstance(
+            fair_probabilities,
+            dict
+        ):
+            fair_probabilities = {}
+
+        return (
+            team,
+            opponent,
+            game_date,
+            fair_probabilities
+        )
+
     team = request.args.get(
         "team",
         ""
@@ -371,46 +540,11 @@ def validate_game_request():
         ""
     ).strip()
 
-    if not team or not opponent or not game_date:
-        return (
-            None,
-            None,
-            None,
-            jsonify(
-                error=(
-                    "Provide team, opponent, "
-                    "and date."
-                )
-            ),
-            400
-        )
-
-    try:
-        datetime.strptime(
-            game_date,
-            "%Y-%m-%d"
-        )
-
-    except ValueError:
-        return (
-            None,
-            None,
-            None,
-            jsonify(
-                error=(
-                    "Date must use "
-                    "YYYY-MM-DD format"
-                )
-            ),
-            400
-        )
-
     return (
         team,
         opponent,
         game_date,
-        None,
-        None
+        {}
     )
 
 
@@ -431,16 +565,31 @@ def market(ticker):
 
 @app.get("/game")
 def game():
-    (
+    team = request.args.get(
+        "team",
+        ""
+    ).strip()
+
+    opponent = request.args.get(
+        "opponent",
+        ""
+    ).strip()
+
+    game_date = request.args.get(
+        "date",
+        ""
+    ).strip()
+
+    valid, message = validate_values(
         team,
         opponent,
-        game_date,
-        error_response,
-        error_code
-    ) = validate_game_request()
+        game_date
+    )
 
-    if error_response:
-        return error_response, error_code
+    if not valid:
+        return jsonify(
+            error=message
+        ), 400
 
     try:
         data = build_game_data(
@@ -477,18 +626,28 @@ def game():
         ), 502
 
 
-@app.get("/analyze")
+@app.route(
+    "/analyze",
+    methods=["GET", "POST"]
+)
 def analyze():
     (
         team,
         opponent,
         game_date,
-        error_response,
-        error_code
-    ) = validate_game_request()
+        fair_probabilities
+    ) = read_analyze_request()
 
-    if error_response:
-        return error_response, error_code
+    valid, message = validate_values(
+        team,
+        opponent,
+        game_date
+    )
+
+    if not valid:
+        return jsonify(
+            error=message
+        ), 400
 
     try:
         data = build_game_data(
@@ -510,17 +669,33 @@ def analyze():
 
         winner_candidates = analysis_candidates(
             data["game_winner"],
-            "winner"
+            "winner",
+            fair_probabilities
         )
 
         spread_candidates = analysis_candidates(
             data["spread"],
-            "spread"
+            "spread",
+            fair_probabilities
         )
 
         total_candidates = analysis_candidates(
             data["total"],
-            "total"
+            "total",
+            fair_probabilities
+        )
+
+        supplied_count = sum(
+            1
+            for group in [
+                winner_candidates,
+                spread_candidates,
+                total_candidates
+            ]
+            for item in group
+            if item[
+                "fair_probability_supplied"
+            ]
         )
 
         return jsonify(
@@ -532,6 +707,31 @@ def analyze():
                 "spread": data["spread_event"],
                 "total": data["total_event"]
             },
+            methodology={
+                "fair_probability": (
+                    "Must be supplied externally. "
+                    "Kalshi prices are not used "
+                    "to create the fair probability."
+                ),
+                "market_probability": (
+                    "Current executable ask price."
+                ),
+                "edge": (
+                    "Fair probability minus "
+                    "entry price."
+                ),
+                "expected_profit_per_contract": (
+                    "Fair probability minus "
+                    "contract cost."
+                ),
+                "expected_roi": (
+                    "Expected profit divided "
+                    "by contract cost."
+                )
+            },
+            fair_probabilities_received=(
+                supplied_count
+            ),
             summary={
                 "winner_contracts": len(
                     winner_candidates
@@ -596,3 +796,4 @@ def smu_today():
         return jsonify(
             error=str(e)
         ), 502
+        
