@@ -1851,3 +1851,285 @@ def smu_today():
         return jsonify(
             error=str(e)
         ), 502
+
+# ============================================================
+# HISTORICAL HOME-FIELD ELO CALIBRATION
+# ============================================================
+
+def calibration_games(start_year=2021, end_year=2025):
+    games_used = []
+    yearly_counts = {}
+
+    for year in range(start_year, end_year + 1):
+        games = cfbd_get(
+            "/games",
+            params={
+                "year": year,
+                "seasonType": "regular"
+            }
+        )
+
+        count = 0
+
+        for game in games:
+            # Completed games only
+            if not game.get("completed"):
+                continue
+
+            # Exclude neutral-site games
+            if game.get("neutralSite"):
+                continue
+
+            # FBS vs FBS only
+            if game.get("homeClassification") != "fbs":
+                continue
+
+            if game.get("awayClassification") != "fbs":
+                continue
+
+            home_elo = number(
+                game.get("homePregameElo")
+            )
+
+            away_elo = number(
+                game.get("awayPregameElo")
+            )
+
+            home_points = number(
+                game.get("homePoints")
+            )
+
+            away_points = number(
+                game.get("awayPoints")
+            )
+
+            if (
+                home_elo is None
+                or away_elo is None
+                or home_points is None
+                or away_points is None
+            ):
+                continue
+
+            # Exclude ties
+            if home_points == away_points:
+                continue
+
+            games_used.append({
+                "year": year,
+                "home_elo": home_elo,
+                "away_elo": away_elo,
+                "home_win": (
+                    1
+                    if home_points > away_points
+                    else 0
+                )
+            })
+
+            count += 1
+
+        yearly_counts[str(year)] = count
+
+    return games_used, yearly_counts
+
+
+def calibration_log_loss(games, home_field_elo):
+    total_loss = 0.0
+
+    for game in games:
+        rating_difference = (
+            game["home_elo"]
+            - game["away_elo"]
+            + home_field_elo
+        )
+
+        probability = elo_probability(
+            rating_difference
+        )
+
+        # Protect log() from 0 or 1
+        probability = max(
+            0.000001,
+            min(
+                0.999999,
+                probability
+            )
+        )
+
+        actual = game["home_win"]
+
+        total_loss += -(
+            actual * math.log(probability)
+            +
+            (1 - actual)
+            * math.log(1 - probability)
+        )
+
+    return total_loss / len(games)
+
+
+def fit_home_field_elo(games):
+    best_hfa = None
+    best_loss = None
+
+    # Search from -100 to +200 Elo
+    # in 0.5-point increments.
+    step = 0.5
+
+    value = -100.0
+
+    while value <= 200.0:
+        loss = calibration_log_loss(
+            games,
+            value
+        )
+
+        if (
+            best_loss is None
+            or loss < best_loss
+        ):
+            best_loss = loss
+            best_hfa = value
+
+        value += step
+
+    return best_hfa, best_loss
+
+
+@app.get("/calibrate-home-field")
+def calibrate_home_field():
+    try:
+        games, yearly_counts = (
+            calibration_games(
+                2021,
+                2025
+            )
+        )
+
+        if not games:
+            return jsonify(
+                success=False,
+                error=(
+                    "No qualifying historical "
+                    "games were returned."
+                )
+            ), 500
+
+        best_hfa, best_loss = (
+            fit_home_field_elo(
+                games
+            )
+        )
+
+        zero_hfa_loss = (
+            calibration_log_loss(
+                games,
+                0.0
+            )
+        )
+
+        home_wins = sum(
+            game["home_win"]
+            for game in games
+        )
+
+        home_win_rate = (
+            home_wins
+            / len(games)
+        )
+
+        improvement = (
+            zero_hfa_loss
+            - best_loss
+        )
+
+        return jsonify(
+            success=True,
+
+            calibration_period={
+                "start_year": 2021,
+                "end_year": 2025
+            },
+
+            filters={
+                "completed_only": True,
+                "regular_season_only": True,
+                "non_neutral_only": True,
+                "fbs_vs_fbs_only": True,
+                "ties_excluded": True,
+                "pregame_elo_required": True
+            },
+
+            sample_size=len(games),
+
+            games_by_year=yearly_counts,
+
+            home_wins=home_wins,
+
+            home_win_rate=round(
+                home_win_rate,
+                6
+            ),
+
+            home_win_rate_percent=round(
+                home_win_rate * 100,
+                2
+            ),
+
+            fitted_home_field_elo_points=(
+                best_hfa
+            ),
+
+            log_loss_without_home_field=round(
+                zero_hfa_loss,
+                6
+            ),
+
+            log_loss_with_home_field=round(
+                best_loss,
+                6
+            ),
+
+            log_loss_improvement=round(
+                improvement,
+                6
+            ),
+
+            methodology={
+                "model": (
+                    "P(home win) = "
+                    "1 / (1 + 10^("
+                    "-((home Elo - away Elo "
+                    "+ HFA) / 400)))"
+                ),
+
+                "objective": (
+                    "Choose the HFA Elo value "
+                    "that minimizes average "
+                    "binary log loss on "
+                    "historical winners."
+                ),
+
+                "search_range": (
+                    "-100 to +200 Elo points"
+                ),
+
+                "search_increment": (
+                    "0.5 Elo points"
+                ),
+
+                "kalshi_used": False
+            }
+        )
+
+    except RuntimeError as e:
+        return jsonify(
+            success=False,
+            error=str(e)
+        ), 500
+
+    except requests.RequestException as e:
+        return jsonify(
+            success=False,
+            error=str(e)
+        ), 502
