@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import requests
 
 app = Flask(__name__)
@@ -14,132 +14,79 @@ def home():
     )
 
 
+def kalshi_get(path, params=None):
+    r = requests.get(
+        f"{KALSHI_BASE}{path}",
+        params=params,
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_event_markets(event_ticker):
+    data = kalshi_get(
+        "/markets",
+        params={
+            "event_ticker": event_ticker,
+            "limit": 1000
+        }
+    )
+    return data.get("markets", [])
+
+
+def compact_market(m):
+    return {
+        "ticker": m.get("ticker"),
+        "event_ticker": m.get("event_ticker"),
+        "title": m.get("title"),
+        "subtitle": m.get("subtitle"),
+        "yes_sub_title": m.get("yes_sub_title"),
+        "no_sub_title": m.get("no_sub_title"),
+        "yes_bid": m.get("yes_bid"),
+        "yes_ask": m.get("yes_ask"),
+        "no_bid": m.get("no_bid"),
+        "no_ask": m.get("no_ask"),
+        "last_price": m.get("last_price"),
+        "volume": m.get("volume"),
+        "open_interest": m.get("open_interest"),
+        "close_time": m.get("close_time")
+    }
+
+
 @app.get("/market/<ticker>")
 def market(ticker):
     try:
-        r = requests.get(
-            f"{KALSHI_BASE}/markets/{ticker}",
-            timeout=15
-        )
-
-        return (
-            r.text,
-            r.status_code,
-            {"Content-Type": "application/json"}
-        )
+        data = kalshi_get(f"/markets/{ticker}")
+        return jsonify(data)
 
     except requests.RequestException as e:
         return jsonify(error=str(e)), 502
 
 
-def get_markets(max_pages=10):
-    markets = []
-    cursor = None
-
-    for _ in range(max_pages):
-        params = {
-            "limit": 1000,
-            "status": "open"
-        }
-
-        if cursor:
-            params["cursor"] = cursor
-
-        r = requests.get(
-            f"{KALSHI_BASE}/markets",
-            params=params,
-            timeout=20
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-        markets.extend(data.get("markets", []))
-
-        cursor = data.get("cursor")
-
-        if not cursor:
-            break
-
-    return markets
-
-
-def basic_text(market):
-    fields = [
-        market.get("ticker", ""),
-        market.get("event_ticker", ""),
-        market.get("title", ""),
-        market.get("subtitle", ""),
-        market.get("yes_sub_title", ""),
-        market.get("no_sub_title", "")
-    ]
-
-    return " ".join(str(x) for x in fields).lower()
-
-
-@app.get("/search")
-def search():
-    query = request.args.get("q", "").strip()
-
-    if not query:
-        return jsonify(error="Use /search?q=SMU"), 400
-
+@app.get("/smu-today")
+def smu_today():
     try:
-        markets = get_markets(max_pages=10)
-        q = query.lower()
+        game_event = "KXNCAAFGAME-26SEP07SMUFSU"
+        spread_event = "KXNCAAFSPREAD-26SEP07SMUFSU"
+        total_event = "KXNCAAFTOTAL-26SEP07SMUFSU"
 
-        matches = [
-            m for m in markets
-            if q in basic_text(m)
-        ]
+        game_winner = get_event_markets(game_event)
+        spreads = get_event_markets(spread_event)
+        totals = get_event_markets(total_event)
 
         return jsonify(
-            query=query,
-            count=len(matches),
-            markets=matches[:100]
-        )
-
-    except requests.RequestException as e:
-        return jsonify(error=str(e)), 502
-
-
-@app.get("/smu-debug")
-def smu_debug():
-    try:
-        markets = get_markets(max_pages=10)
-        matches = []
-
-        for m in markets:
-            ticker = m.get("ticker") or ""
-            event_ticker = m.get("event_ticker") or ""
-            text = basic_text(m)
-
-            if "smu" not in text:
-                continue
-
-            if ticker.startswith("KXMVE") or event_ticker.startswith("KXMVE"):
-                continue
-
-            matches.append({
-                "ticker": ticker,
-                "event_ticker": event_ticker,
-                "title": m.get("title"),
-                "subtitle": m.get("subtitle"),
-                "yes_sub_title": m.get("yes_sub_title"),
-                "no_sub_title": m.get("no_sub_title"),
-                "yes_bid": m.get("yes_bid"),
-                "yes_ask": m.get("yes_ask"),
-                "no_bid": m.get("no_bid"),
-                "no_ask": m.get("no_ask"),
-                "last_price": m.get("last_price"),
-                "open_time": m.get("open_time"),
-                "close_time": m.get("close_time"),
-                "expiration_time": m.get("expiration_time")
-            })
-
-        return jsonify(
-            count=len(matches),
-            markets=matches[:100]
+            matchup="SMU vs Florida State",
+            date="2026-09-07",
+            game_winner=[
+                compact_market(m) for m in game_winner
+            ],
+            spread=[
+                compact_market(m) for m in spreads
+            ],
+            total=[
+                compact_market(m) for m in totals
+            ]
         )
 
     except requests.RequestException as e:
