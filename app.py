@@ -43,13 +43,17 @@ def compact_market(m):
         "subtitle": m.get("subtitle"),
         "yes_sub_title": m.get("yes_sub_title"),
         "no_sub_title": m.get("no_sub_title"),
-        "yes_bid": m.get("yes_bid"),
-        "yes_ask": m.get("yes_ask"),
-        "no_bid": m.get("no_bid"),
-        "no_ask": m.get("no_ask"),
-        "last_price": m.get("last_price"),
-        "volume": m.get("volume"),
-        "open_interest": m.get("open_interest"),
+
+        "yes_bid_dollars": m.get("yes_bid_dollars"),
+        "yes_ask_dollars": m.get("yes_ask_dollars"),
+        "no_bid_dollars": m.get("no_bid_dollars"),
+        "no_ask_dollars": m.get("no_ask_dollars"),
+        "last_price_dollars": m.get("last_price_dollars"),
+
+        "volume_fp": m.get("volume_fp"),
+        "volume_24h_fp": m.get("volume_24h_fp"),
+        "open_interest_fp": m.get("open_interest_fp"),
+
         "close_time": m.get("close_time")
     }
 
