@@ -19,7 +19,7 @@ def market(ticker):
     try:
         r = requests.get(
             f"{KALSHI_BASE}/markets/{ticker}",
-            timeout=15
+            timeout=10
         )
         return (
             r.text,
@@ -32,30 +32,32 @@ def market(ticker):
 
 @app.get("/markets")
 def markets():
-    params = {
-        "limit": request.args.get("limit", "100")
-    }
-
-    cursor = request.args.get("cursor")
-    status = request.args.get("status")
-
-    if cursor:
-        params["cursor"] = cursor
-
-    if status:
-        params["status"] = status
-
     try:
+        params = {"limit": 1000}
+
+        status = request.args.get("status")
+        series_ticker = request.args.get("series_ticker")
+        event_ticker = request.args.get("event_ticker")
+
+        if status:
+            params["status"] = status
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+
         r = requests.get(
             f"{KALSHI_BASE}/markets",
             params=params,
             timeout=15
         )
+
         return (
             r.text,
             r.status_code,
             {"Content-Type": "application/json"}
         )
+
     except requests.RequestException as e:
         return jsonify(error=str(e)), 502
 
@@ -66,15 +68,15 @@ def search():
 
     if not query:
         return jsonify(
-            error="Add a search term using ?q=example"
+            error="Add a search term, for example /search?q=football"
         ), 400
 
-    matches = []
-    cursor = None
-    pages_checked = 0
-    max_pages = 50
-
     try:
+        matches = []
+        cursor = None
+        pages_checked = 0
+        max_pages = 5
+
         while pages_checked < max_pages:
             params = {
                 "limit": 1000,
@@ -87,19 +89,19 @@ def search():
             r = requests.get(
                 f"{KALSHI_BASE}/markets",
                 params=params,
-                timeout=20
+                timeout=10
             )
             r.raise_for_status()
 
             data = r.json()
-            markets_list = data.get("markets", [])
+            pages_checked += 1
 
-            for market in markets_list:
+            for market in data.get("markets", []):
                 searchable = " ".join([
-                    str(market.get("title", "")),
-                    str(market.get("subtitle", "")),
                     str(market.get("ticker", "")),
                     str(market.get("event_ticker", "")),
+                    str(market.get("title", "")),
+                    str(market.get("subtitle", "")),
                     str(market.get("yes_sub_title", "")),
                     str(market.get("no_sub_title", ""))
                 ]).lower()
@@ -107,7 +109,6 @@ def search():
                 if query in searchable:
                     matches.append(market)
 
-            pages_checked += 1
             cursor = data.get("cursor")
 
             if not cursor:
