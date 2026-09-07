@@ -68,26 +68,115 @@ def normalize(text):
 
 TEAM_ALIASES = {
     "SMU": ["SMU"],
-    "FLORIDASTATE": ["FSU", "FLORIDASTATE"],
-    "FSU": ["FSU", "FLORIDASTATE"],
-    "AUBURN": ["AUB", "AUBURN"],
-    "ALABAMA": ["BAMA", "ALA", "ALABAMA"],
-    "GEORGIA": ["UGA", "GEORGIA"],
-    "NOTREDAME": ["ND", "NOTREDAME"],
-    "OLEMISS": ["MISS", "OLEMISS"],
+
+    "FLORIDASTATE": [
+        "FSU",
+        "FLORIDASTATE"
+    ],
+
+    "FSU": [
+        "FSU",
+        "FLORIDASTATE"
+    ],
+
+    "FLORIDAAM": [
+        "FAMU",
+        "FLORIDAAM"
+    ],
+
+    "FAMU": [
+        "FAMU",
+        "FLORIDAAM"
+    ],
+
+    "MIAMI": [
+        "MIA",
+        "MIAMI"
+    ],
+
+    "MIAMIFL": [
+        "MIA",
+        "MIAMI",
+        "MIAMIFL"
+    ],
+
+    "AUBURN": [
+        "AUB",
+        "AUBURN"
+    ],
+
+    "ALABAMA": [
+        "BAMA",
+        "ALA",
+        "ALABAMA"
+    ],
+
+    "GEORGIA": [
+        "UGA",
+        "GEORGIA"
+    ],
+
+    "NOTREDAME": [
+        "ND",
+        "NOTREDAME"
+    ],
+
+    "OLEMISS": [
+        "MISS",
+        "OLEMISS"
+    ],
+
     "LSU": ["LSU"],
-    "CLEMSON": ["CLEM", "CLEMSON"],
-    "TEXAS": ["TEX", "TEXAS"],
-    "TEXASA&M": ["TAMU", "TEXASAM"],
-    "TEXASAM": ["TAMU", "TEXASAM"],
-    "OHIOSTATE": ["OSU", "OHIOSTATE"],
-    "PENNST": ["PSU", "PENNSTATE"],
-    "PENNSTATE": ["PSU", "PENNSTATE"],
-    "MICHIGAN": ["MICH", "MICHIGAN"],
-    "WISCONSIN": ["WISC", "WISCONSIN"],
-    "WASHINGTON": ["WASH", "WASHINGTON"],
-    "WASHINGTONSTATE": ["WSU", "WASHINGTONSTATE"],
-    "OREGON": ["ORE", "OREGON"]
+
+    "CLEMSON": [
+        "CLEM",
+        "CLEMSON"
+    ],
+
+    "TEXAS": [
+        "TEX",
+        "TEXAS"
+    ],
+
+    "TEXASAM": [
+        "TAMU",
+        "TEXASAM"
+    ],
+
+    "OHIOSTATE": [
+        "OSU",
+        "OHIOSTATE"
+    ],
+
+    "PENNSTATE": [
+        "PSU",
+        "PENNSTATE"
+    ],
+
+    "MICHIGAN": [
+        "MICH",
+        "MICHIGAN"
+    ],
+
+    "WISCONSIN": [
+        "WISC",
+        "WISCONSIN"
+    ],
+
+    "WASHINGTON": [
+        "WASH",
+        "WASHINGTON"
+    ],
+
+    "WASHINGTONSTATE": [
+        "WSU",
+        "WASHINGTONSTATE"
+    ],
+
+    "OREGON": [
+        "ORE",
+        "OREGON"
+    ]
 }
 
 
@@ -116,8 +205,14 @@ def game_market_text(m):
 
 
 def discover_game_event(team, opponent, game_date):
-    date_obj = datetime.strptime(game_date, "%Y-%m-%d")
-    date_code = date_obj.strftime("%y%b%d").upper()
+    date_obj = datetime.strptime(
+        game_date,
+        "%Y-%m-%d"
+    )
+
+    date_code = date_obj.strftime(
+        "%y%b%d"
+    ).upper()
 
     team_aliases = aliases_for(team)
     opponent_aliases = aliases_for(opponent)
@@ -133,10 +228,15 @@ def discover_game_event(team, opponent, game_date):
         if cursor:
             params["cursor"] = cursor
 
-        data = kalshi_get("/markets", params=params)
+        data = kalshi_get(
+            "/markets",
+            params=params
+        )
 
         for m in data.get("markets", []):
-            ticker = str(m.get("ticker", "")).upper()
+            ticker = str(
+                m.get("ticker", "")
+            ).upper()
 
             if date_code not in ticker:
                 continue
@@ -144,15 +244,19 @@ def discover_game_event(team, opponent, game_date):
             text = game_market_text(m)
 
             team_match = any(
-                alias in text for alias in team_aliases
+                alias in text
+                for alias in team_aliases
             )
 
             opponent_match = any(
-                alias in text for alias in opponent_aliases
+                alias in text
+                for alias in opponent_aliases
             )
 
             if team_match and opponent_match:
-                return m.get("event_ticker")
+                return m.get(
+                    "event_ticker"
+                )
 
         cursor = data.get("cursor")
 
@@ -162,11 +266,16 @@ def discover_game_event(team, opponent, game_date):
     return None
 
 
-def related_event_ticker(game_event, market_type):
+def related_event_ticker(
+    game_event,
+    market_type
+):
     if not game_event:
         return None
 
-    if not game_event.startswith("KXNCAAFGAME-"):
+    if not game_event.startswith(
+        "KXNCAAFGAME-"
+    ):
         return None
 
     suffix = game_event.split(
@@ -175,10 +284,14 @@ def related_event_ticker(game_event, market_type):
     )[1]
 
     if market_type == "spread":
-        return f"KXNCAAFSPREAD-{suffix}"
+        return (
+            f"KXNCAAFSPREAD-{suffix}"
+        )
 
     if market_type == "total":
-        return f"KXNCAAFTOTAL-{suffix}"
+        return (
+            f"KXNCAAFTOTAL-{suffix}"
+        )
 
     return game_event
 
@@ -189,10 +302,13 @@ def market(ticker):
         data = kalshi_get(
             f"/markets/{ticker}"
         )
+
         return jsonify(data)
 
     except requests.RequestException as e:
-        return jsonify(error=str(e)), 502
+        return jsonify(
+            error=str(e)
+        ), 502
 
 
 @app.get("/game")
@@ -226,9 +342,13 @@ def game():
             game_date,
             "%Y-%m-%d"
         )
+
     except ValueError:
         return jsonify(
-            error="Date must use YYYY-MM-DD format"
+            error=(
+                "Date must use "
+                "YYYY-MM-DD format"
+            )
         ), 400
 
     try:
@@ -238,33 +358,49 @@ def game():
             game_date
         )
 
-        spread_event = related_event_ticker(
-            game_event,
-            "spread"
+        spread_event = (
+            related_event_ticker(
+                game_event,
+                "spread"
+            )
         )
 
-        total_event = related_event_ticker(
-            game_event,
-            "total"
+        total_event = (
+            related_event_ticker(
+                game_event,
+                "total"
+            )
         )
 
         game_winner = (
-            get_event_markets(game_event)
-            if game_event else []
+            get_event_markets(
+                game_event
+            )
+            if game_event
+            else []
         )
 
         spreads = (
-            get_event_markets(spread_event)
-            if spread_event else []
+            get_event_markets(
+                spread_event
+            )
+            if spread_event
+            else []
         )
 
         totals = (
-            get_event_markets(total_event)
-            if total_event else []
+            get_event_markets(
+                total_event
+            )
+            if total_event
+            else []
         )
 
         return jsonify(
-            matchup=f"{team} vs {opponent}",
+            matchup=(
+                f"{team} vs {opponent}"
+            ),
+
             date=game_date,
 
             event_tickers={
@@ -290,7 +426,9 @@ def game():
         )
 
     except requests.RequestException as e:
-        return jsonify(error=str(e)), 502
+        return jsonify(
+            error=str(e)
+        ), 502
 
 
 @app.get("/smu-today")
@@ -335,4 +473,6 @@ def smu_today():
         )
 
     except requests.RequestException as e:
-        return jsonify(error=str(e)), 502
+        return jsonify(
+            error=str(e)
+        ), 502
