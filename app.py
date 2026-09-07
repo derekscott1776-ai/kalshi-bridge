@@ -11,13 +11,18 @@ KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CFBD_BASE = "https://api.collegefootballdata.com"
 CFBD_API_KEY = os.environ.get("CFBD_API_KEY", "").strip()
 
+# Calibrated from 3,611 completed, non-neutral,
+# FBS-vs-FBS regular-season games from 2021-2025.
+CALIBRATED_HOME_FIELD_ELO = 67.0
+
 
 @app.get("/")
 def home():
     return jsonify(
         status="ok",
         message="Kalshi bridge is running",
-        cfbd_configured=bool(CFBD_API_KEY)
+        cfbd_configured=bool(CFBD_API_KEY),
+        calibrated_home_field_elo=CALIBRATED_HOME_FIELD_ELO
     )
 
 
@@ -303,18 +308,14 @@ def build_game_data(
         game_date
     )
 
-    spread_event = (
-        related_event_ticker(
-            game_event,
-            "spread"
-        )
+    spread_event = related_event_ticker(
+        game_event,
+        "spread"
     )
 
-    total_event = (
-        related_event_ticker(
-            game_event,
-            "total"
-        )
+    total_event = related_event_ticker(
+        game_event,
+        "total"
     )
 
     game_winner = (
@@ -372,7 +373,6 @@ def cfbd_get(path, params=None):
     )
 
     r.raise_for_status()
-
     return r.json()
 
 
@@ -443,8 +443,7 @@ def game_pair_score(
     return {
         "score": best_orientation,
         "team_match": best_team_match,
-        "opponent_match":
-            best_opponent_match
+        "opponent_match": best_opponent_match
     }
 
 
@@ -500,7 +499,6 @@ def discover_cfbd_game(
                 game
             )
 
-    # Fallback for a naming mismatch
     if not games:
         games = cfbd_get(
             "/games",
@@ -526,11 +524,9 @@ def discover_cfbd_game(
         ):
             continue
 
-        start_dt = (
-            parse_iso_datetime(
-                game.get(
-                    "startDate"
-                )
+        start_dt = parse_iso_datetime(
+            game.get(
+                "startDate"
             )
         )
 
@@ -544,8 +540,6 @@ def discover_cfbd_game(
             ).days
         )
 
-        # UTC date can differ from
-        # the US local game date by one day.
         if date_difference > 1:
             continue
 
@@ -558,10 +552,8 @@ def discover_cfbd_game(
         )
 
         candidates.append({
-            "score":
-                adjusted_score,
-            "game":
-                game
+            "score": adjusted_score,
+            "game": game
         })
 
     if not candidates:
@@ -627,13 +619,8 @@ def build_cfbd_game_context(
         team_side = "home"
         opponent_side = "away"
 
-        team_cfbd_name = (
-            home_team
-        )
-
-        opponent_cfbd_name = (
-            away_team
-        )
+        team_cfbd_name = home_team
+        opponent_cfbd_name = away_team
 
         team_pregame_elo = number(
             game.get(
@@ -651,13 +638,8 @@ def build_cfbd_game_context(
         team_side = "away"
         opponent_side = "home"
 
-        team_cfbd_name = (
-            away_team
-        )
-
-        opponent_cfbd_name = (
-            home_team
-        )
+        team_cfbd_name = away_team
+        opponent_cfbd_name = home_team
 
         team_pregame_elo = number(
             game.get(
@@ -792,12 +774,10 @@ def build_probability_model(
     opponent,
     game_date
 ):
-    context = (
-        build_cfbd_game_context(
-            team,
-            opponent,
-            game_date
-        )
+    context = build_cfbd_game_context(
+        team,
+        opponent,
+        game_date
     )
 
     if not context.get(
@@ -806,23 +786,19 @@ def build_probability_model(
         return {
             "available": False,
             "model":
-                "CFBD pregame Elo baseline",
+                "CFBD pregame Elo + calibrated home field",
             "reason":
                 context.get(
                     "reason"
                 )
         }
 
-    team_elo = (
-        context.get(
-            "team_pregame_elo"
-        )
+    team_elo = context.get(
+        "team_pregame_elo"
     )
 
-    opponent_elo = (
-        context.get(
-            "opponent_pregame_elo"
-        )
+    opponent_elo = context.get(
+        "opponent_pregame_elo"
     )
 
     if (
@@ -834,7 +810,7 @@ def build_probability_model(
             "available": False,
 
             "model":
-                "CFBD pregame Elo baseline",
+                "CFBD pregame Elo + calibrated home field",
 
             "reason":
                 "The matching game does not "
@@ -850,31 +826,58 @@ def build_probability_model(
         - opponent_elo
     )
 
-    # IMPORTANT:
-    #
-    # We now know whether the selected
-    # team is home, away, or playing
-    # at a neutral site.
-    #
-    # But we have NOT yet historically
-    # calibrated how many Elo points
-    # home field should be worth.
-    #
-    # Therefore the location adjustment
-    # remains zero rather than using an
-    # invented value.
+    neutral_site = context.get(
+        "neutral_site",
+        False
+    )
 
-    home_field_adjustment = 0.0
+    team_home_away = context.get(
+        "team_home_away"
+    )
+
+    if neutral_site:
+        home_field_adjustment = 0.0
+        location_reason = (
+            "Neutral-site game: no "
+            "home-field adjustment applied."
+        )
+
+    elif team_home_away == "home":
+        home_field_adjustment = (
+            CALIBRATED_HOME_FIELD_ELO
+        )
+
+        location_reason = (
+            "Selected team is home: "
+            "+67 Elo applied."
+        )
+
+    elif team_home_away == "away":
+        home_field_adjustment = (
+            -CALIBRATED_HOME_FIELD_ELO
+        )
+
+        location_reason = (
+            "Selected team is away: "
+            "-67 Elo applied from the "
+            "selected team's perspective."
+        )
+
+    else:
+        home_field_adjustment = 0.0
+
+        location_reason = (
+            "Home/away status unavailable: "
+            "no location adjustment applied."
+        )
 
     adjusted_rating_difference = (
         raw_rating_difference
         + home_field_adjustment
     )
 
-    team_probability = (
-        elo_probability(
-            adjusted_rating_difference
-        )
+    team_probability = elo_probability(
+        adjusted_rating_difference
     )
 
     opponent_probability = (
@@ -886,10 +889,10 @@ def build_probability_model(
         "available": True,
 
         "model":
-            "CFBD pregame Elo baseline",
+            "CFBD pregame Elo + calibrated home field",
 
         "model_version":
-            "cfbd-pregame-elo-v2",
+            "cfbd-pregame-elo-hfa-v3",
 
         "game_context":
             context,
@@ -906,20 +909,23 @@ def build_probability_model(
                 2
             ),
 
+        "calibrated_home_field_elo":
+            CALIBRATED_HOME_FIELD_ELO,
+
+        "neutral_site":
+            neutral_site,
+
+        "team_home_away":
+            team_home_away,
+
         "home_field_adjustment_elo_points":
             home_field_adjustment,
 
         "home_field_adjustment_calibrated":
-            False,
+            True,
 
         "home_field_adjustment_status":
-            (
-                "Venue and home/away data "
-                "are known, but no arbitrary "
-                "home-field Elo adjustment "
-                "is applied. Historical "
-                "calibration is the next step."
-            ),
+            location_reason,
 
         "adjusted_rating_difference":
             round(
@@ -957,8 +963,10 @@ def build_probability_model(
             (
                 "Fair probability uses the "
                 "matching CFBD game's pregame "
-                "Elo ratings. Kalshi prices "
-                "are not inputs to the model."
+                "Elo ratings plus the historically "
+                "calibrated home-field adjustment. "
+                "Kalshi prices are not inputs "
+                "to the probability model."
             )
     }
 
@@ -971,10 +979,8 @@ def expected_metrics(
     fair_probability,
     entry_price
 ):
-    fair_probability = (
-        clamp_probability(
-            fair_probability
-        )
+    fair_probability = clamp_probability(
+        fair_probability
     )
 
     entry_price = number(
@@ -1118,10 +1124,8 @@ def analysis_market(
             4
         )
 
-    fair_yes = (
-        clamp_probability(
-            fair_yes_probability
-        )
+    fair_yes = clamp_probability(
+        fair_yes_probability
     )
 
     fair_no = (
@@ -1264,17 +1268,13 @@ def find_winner_fair_probabilities(
     ):
         return probabilities
 
-    team_probability = (
-        probability_model[
-            "team_fair_probability"
-        ]
-    )
+    team_probability = probability_model[
+        "team_fair_probability"
+    ]
 
-    opponent_probability = (
-        probability_model[
-            "opponent_fair_probability"
-        ]
-    )
+    opponent_probability = probability_model[
+        "opponent_fair_probability"
+    ]
 
     for market in markets:
         ticker = market.get(
@@ -1381,9 +1381,7 @@ def cfbd_test():
     if not CFBD_API_KEY:
         return jsonify(
             configured=False,
-            error=(
-                "CFBD_API_KEY is missing"
-            )
+            error="CFBD_API_KEY is missing"
         ), 500
 
     try:
@@ -1431,12 +1429,10 @@ def cfbd_game():
         ""
     ).strip()
 
-    valid, message = (
-        validate_values(
-            team,
-            opponent,
-            game_date
-        )
+    valid, message = validate_values(
+        team,
+        opponent,
+        game_date
     )
 
     if not valid:
@@ -1445,12 +1441,10 @@ def cfbd_game():
         ), 400
 
     try:
-        context = (
-            build_cfbd_game_context(
-                team,
-                opponent,
-                game_date
-            )
+        context = build_cfbd_game_context(
+            team,
+            opponent,
+            game_date
         )
 
         return jsonify(
@@ -1489,12 +1483,10 @@ def game():
         ""
     ).strip()
 
-    valid, message = (
-        validate_values(
-            team,
-            opponent,
-            game_date
-        )
+    valid, message = validate_values(
+        team,
+        opponent,
+        game_date
     )
 
     if not valid:
@@ -1581,12 +1573,10 @@ def analyze():
         ""
     ).strip()
 
-    valid, message = (
-        validate_values(
-            team,
-            opponent,
-            game_date
-        )
+    valid, message = validate_values(
+        team,
+        opponent,
+        game_date
     )
 
     if not valid:
@@ -1618,51 +1608,41 @@ def analyze():
                 )
             ), 404
 
-        probability_model = (
-            build_probability_model(
-                team,
-                opponent,
-                game_date
-            )
+        probability_model = build_probability_model(
+            team,
+            opponent,
+            game_date
         )
 
-        winner_probabilities = (
-            find_winner_fair_probabilities(
-                data[
-                    "game_winner"
-                ],
-                team,
-                opponent,
-                probability_model
-            )
+        winner_probabilities = find_winner_fair_probabilities(
+            data[
+                "game_winner"
+            ],
+            team,
+            opponent,
+            probability_model
         )
 
-        winner_candidates = (
-            analysis_candidates(
-                data[
-                    "game_winner"
-                ],
-                "winner",
-                winner_probabilities
-            )
+        winner_candidates = analysis_candidates(
+            data[
+                "game_winner"
+            ],
+            "winner",
+            winner_probabilities
         )
 
-        spread_candidates = (
-            analysis_candidates(
-                data[
-                    "spread"
-                ],
+        spread_candidates = analysis_candidates(
+            data[
                 "spread"
-            )
+            ],
+            "spread"
         )
 
-        total_candidates = (
-            analysis_candidates(
-                data[
-                    "total"
-                ],
+        total_candidates = analysis_candidates(
+            data[
                 "total"
-            )
+            ],
+            "total"
         )
 
         return jsonify(
@@ -1695,11 +1675,23 @@ def analyze():
 
                 "home_field":
                     (
-                        "Location is identified "
-                        "but the home-field Elo "
-                        "coefficient is currently "
-                        "zero until historical "
-                        "calibration is completed."
+                        "A +67 Elo home-field "
+                        "adjustment is applied to "
+                        "the home team. From the "
+                        "selected team's perspective "
+                        "this is +67 when home, "
+                        "-67 when away, and 0 on "
+                        "neutral sites."
+                    ),
+
+                "home_field_calibration":
+                    (
+                        "67 Elo points was fitted "
+                        "on 3,611 completed "
+                        "non-neutral FBS-vs-FBS "
+                        "regular-season games from "
+                        "2021-2025 by minimizing "
+                        "binary log loss."
                     ),
 
                 "kalshi_role":
@@ -1732,11 +1724,10 @@ def analyze():
                 "limitations":
                     (
                         "Fees, slippage, injuries, "
-                        "weather, matchup "
-                        "efficiency, roster "
-                        "changes and a calibrated "
-                        "home-field coefficient "
-                        "are not yet included."
+                        "weather, matchup efficiency, "
+                        "roster changes and model "
+                        "calibration beyond Elo plus "
+                        "home field are not yet included."
                     )
             },
 
@@ -1852,15 +1843,22 @@ def smu_today():
             error=str(e)
         ), 502
 
+
 # ============================================================
 # HISTORICAL HOME-FIELD ELO CALIBRATION
 # ============================================================
 
-def calibration_games(start_year=2021, end_year=2025):
+def calibration_games(
+    start_year=2021,
+    end_year=2025
+):
     games_used = []
     yearly_counts = {}
 
-    for year in range(start_year, end_year + 1):
+    for year in range(
+        start_year,
+        end_year + 1
+    ):
         games = cfbd_get(
             "/games",
             params={
@@ -1872,35 +1870,54 @@ def calibration_games(start_year=2021, end_year=2025):
         count = 0
 
         for game in games:
-            # Completed games only
-            if not game.get("completed"):
+            if not game.get(
+                "completed"
+            ):
                 continue
 
-            # Exclude neutral-site games
-            if game.get("neutralSite"):
+            if game.get(
+                "neutralSite"
+            ):
                 continue
 
-            # FBS vs FBS only
-            if game.get("homeClassification") != "fbs":
+            if (
+                game.get(
+                    "homeClassification"
+                )
+                != "fbs"
+            ):
                 continue
 
-            if game.get("awayClassification") != "fbs":
+            if (
+                game.get(
+                    "awayClassification"
+                )
+                != "fbs"
+            ):
                 continue
 
             home_elo = number(
-                game.get("homePregameElo")
+                game.get(
+                    "homePregameElo"
+                )
             )
 
             away_elo = number(
-                game.get("awayPregameElo")
+                game.get(
+                    "awayPregameElo"
+                )
             )
 
             home_points = number(
-                game.get("homePoints")
+                game.get(
+                    "homePoints"
+                )
             )
 
             away_points = number(
-                game.get("awayPoints")
+                game.get(
+                    "awayPoints"
+                )
             )
 
             if (
@@ -1911,35 +1928,58 @@ def calibration_games(start_year=2021, end_year=2025):
             ):
                 continue
 
-            # Exclude ties
-            if home_points == away_points:
+            if (
+                home_points
+                == away_points
+            ):
                 continue
 
             games_used.append({
-                "year": year,
-                "home_elo": home_elo,
-                "away_elo": away_elo,
-                "home_win": (
-                    1
-                    if home_points > away_points
-                    else 0
-                )
+                "year":
+                    year,
+
+                "home_elo":
+                    home_elo,
+
+                "away_elo":
+                    away_elo,
+
+                "home_win":
+                    (
+                        1
+                        if
+                        home_points
+                        > away_points
+                        else 0
+                    )
             })
 
             count += 1
 
-        yearly_counts[str(year)] = count
+        yearly_counts[
+            str(year)
+        ] = count
 
-    return games_used, yearly_counts
+    return (
+        games_used,
+        yearly_counts
+    )
 
 
-def calibration_log_loss(games, home_field_elo):
+def calibration_log_loss(
+    games,
+    home_field_elo
+):
     total_loss = 0.0
 
     for game in games:
         rating_difference = (
-            game["home_elo"]
-            - game["away_elo"]
+            game[
+                "home_elo"
+            ]
+            - game[
+                "away_elo"
+            ]
             + home_field_elo
         )
 
@@ -1947,7 +1987,6 @@ def calibration_log_loss(games, home_field_elo):
             rating_difference
         )
 
-        # Protect log() from 0 or 1
         probability = max(
             0.000001,
             min(
@@ -1956,26 +1995,37 @@ def calibration_log_loss(games, home_field_elo):
             )
         )
 
-        actual = game["home_win"]
+        actual = game[
+            "home_win"
+        ]
 
         total_loss += -(
-            actual * math.log(probability)
+            actual
+            * math.log(
+                probability
+            )
             +
-            (1 - actual)
-            * math.log(1 - probability)
+            (
+                1 - actual
+            )
+            * math.log(
+                1 - probability
+            )
         )
 
-    return total_loss / len(games)
+    return (
+        total_loss
+        / len(games)
+    )
 
 
-def fit_home_field_elo(games):
+def fit_home_field_elo(
+    games
+):
     best_hfa = None
     best_loss = None
 
-    # Search from -100 to +200 Elo
-    # in 0.5-point increments.
     step = 0.5
-
     value = -100.0
 
     while value <= 200.0:
@@ -1986,14 +2036,18 @@ def fit_home_field_elo(games):
 
         if (
             best_loss is None
-            or loss < best_loss
+            or
+            loss < best_loss
         ):
             best_loss = loss
             best_hfa = value
 
         value += step
 
-    return best_hfa, best_loss
+    return (
+        best_hfa,
+        best_loss
+    )
 
 
 @app.get("/calibrate-home-field")
@@ -2029,7 +2083,9 @@ def calibrate_home_field():
         )
 
         home_wins = sum(
-            game["home_win"]
+            game[
+                "home_win"
+            ]
             for game in games
         )
 
@@ -2052,73 +2108,106 @@ def calibrate_home_field():
             },
 
             filters={
-                "completed_only": True,
-                "regular_season_only": True,
-                "non_neutral_only": True,
-                "fbs_vs_fbs_only": True,
-                "ties_excluded": True,
-                "pregame_elo_required": True
+                "completed_only":
+                    True,
+
+                "regular_season_only":
+                    True,
+
+                "non_neutral_only":
+                    True,
+
+                "fbs_vs_fbs_only":
+                    True,
+
+                "ties_excluded":
+                    True,
+
+                "pregame_elo_required":
+                    True
             },
 
-            sample_size=len(games),
+            sample_size=
+                len(games),
 
-            games_by_year=yearly_counts,
+            games_by_year=
+                yearly_counts,
 
-            home_wins=home_wins,
+            home_wins=
+                home_wins,
 
-            home_win_rate=round(
-                home_win_rate,
-                6
-            ),
+            home_win_rate=
+                round(
+                    home_win_rate,
+                    6
+                ),
 
-            home_win_rate_percent=round(
-                home_win_rate * 100,
-                2
-            ),
+            home_win_rate_percent=
+                round(
+                    home_win_rate
+                    * 100,
+                    2
+                ),
 
-            fitted_home_field_elo_points=(
-                best_hfa
-            ),
+            fitted_home_field_elo_points=
+                best_hfa,
 
-            log_loss_without_home_field=round(
-                zero_hfa_loss,
-                6
-            ),
+            currently_used_home_field_elo_points=
+                CALIBRATED_HOME_FIELD_ELO,
 
-            log_loss_with_home_field=round(
-                best_loss,
-                6
-            ),
+            matches_live_model=
+                (
+                    best_hfa
+                    == CALIBRATED_HOME_FIELD_ELO
+                ),
 
-            log_loss_improvement=round(
-                improvement,
-                6
-            ),
+            log_loss_without_home_field=
+                round(
+                    zero_hfa_loss,
+                    6
+                ),
+
+            log_loss_with_home_field=
+                round(
+                    best_loss,
+                    6
+                ),
+
+            log_loss_improvement=
+                round(
+                    improvement,
+                    6
+                ),
 
             methodology={
-                "model": (
-                    "P(home win) = "
-                    "1 / (1 + 10^("
-                    "-((home Elo - away Elo "
-                    "+ HFA) / 400)))"
-                ),
+                "model":
+                    (
+                        "P(home win) = "
+                        "1 / (1 + 10^("
+                        "-((home Elo - away Elo "
+                        "+ HFA) / 400)))"
+                    ),
 
-                "objective": (
-                    "Choose the HFA Elo value "
-                    "that minimizes average "
-                    "binary log loss on "
-                    "historical winners."
-                ),
+                "objective":
+                    (
+                        "Choose the HFA Elo value "
+                        "that minimizes average "
+                        "binary log loss on "
+                        "historical winners."
+                    ),
 
-                "search_range": (
-                    "-100 to +200 Elo points"
-                ),
+                "search_range":
+                    (
+                        "-100 to +200 Elo points"
+                    ),
 
-                "search_increment": (
-                    "0.5 Elo points"
-                ),
+                "search_increment":
+                    (
+                        "0.5 Elo points"
+                    ),
 
-                "kalshi_used": False
+                "kalshi_used":
+                    False
             }
         )
 
