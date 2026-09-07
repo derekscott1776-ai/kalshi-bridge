@@ -32,13 +32,12 @@ def market(ticker):
 
 @app.get("/markets")
 def markets():
-    params = {}
+    params = {
+        "limit": request.args.get("limit", "100")
+    }
 
-    limit = request.args.get("limit", "100")
     cursor = request.args.get("cursor")
     status = request.args.get("status")
-
-    params["limit"] = limit
 
     if cursor:
         params["cursor"] = cursor
@@ -70,37 +69,59 @@ def search():
             error="Add a search term using ?q=example"
         ), 400
 
+    matches = []
+    cursor = None
+    pages_checked = 0
+    max_pages = 50
+
     try:
-        r = requests.get(
-            f"{KALSHI_BASE}/markets",
-            params={
+        while pages_checked < max_pages:
+            params = {
                 "limit": 1000,
                 "status": "open"
-            },
-            timeout=20
+            }
+
+            if cursor:
+                params["cursor"] = cursor
+
+            r = requests.get(
+                f"{KALSHI_BASE}/markets",
+                params=params,
+                timeout=20
+            )
+            r.raise_for_status()
+
+            data = r.json()
+            markets_list = data.get("markets", [])
+
+            for market in markets_list:
+                searchable = " ".join([
+                    str(market.get("title", "")),
+                    str(market.get("subtitle", "")),
+                    str(market.get("ticker", "")),
+                    str(market.get("event_ticker", "")),
+                    str(market.get("yes_sub_title", "")),
+                    str(market.get("no_sub_title", ""))
+                ]).lower()
+
+                if query in searchable:
+                    matches.append(market)
+
+            pages_checked += 1
+            cursor = data.get("cursor")
+
+            if not cursor:
+                break
+
+        return jsonify(
+            query=query,
+            count=len(matches),
+            pages_checked=pages_checked,
+            markets=matches
         )
-        r.raise_for_status()
-        data = r.json()
 
     except requests.RequestException as e:
-        return jsonify(error=str(e)), 502
-
-    markets_list = data.get("markets", [])
-    matches = []
-
-    for market in markets_list:
-        searchable = " ".join([
-            str(market.get("title", "")),
-            str(market.get("subtitle", "")),
-            str(market.get("ticker", "")),
-            str(market.get("event_ticker", ""))
-        ]).lower()
-
-        if query in searchable:
-            matches.append(market)
-
-    return jsonify(
-        query=query,
-        count=len(matches),
-        markets=matches
-    )
+        return jsonify(
+            error=str(e),
+            pages_checked=pages_checked
+        ), 502
