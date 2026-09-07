@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 import requests
 from datetime import datetime
+from difflib import SequenceMatcher
 
 app = Flask(__name__)
 
@@ -44,164 +45,78 @@ def compact_market(m):
         "subtitle": m.get("subtitle"),
         "yes_sub_title": m.get("yes_sub_title"),
         "no_sub_title": m.get("no_sub_title"),
-
         "yes_bid_dollars": m.get("yes_bid_dollars"),
         "yes_ask_dollars": m.get("yes_ask_dollars"),
         "no_bid_dollars": m.get("no_bid_dollars"),
         "no_ask_dollars": m.get("no_ask_dollars"),
         "last_price_dollars": m.get("last_price_dollars"),
-
         "volume_fp": m.get("volume_fp"),
         "volume_24h_fp": m.get("volume_24h_fp"),
         "open_interest_fp": m.get("open_interest_fp"),
-
         "close_time": m.get("close_time")
     }
 
 
 def normalize(text):
+    text = str(text or "").lower()
+
+    replacements = {
+        "&": " and ",
+        "st.": "state",
+        "st ": "state ",
+        "florida st": "florida state",
+        "miami fl": "miami",
+        "university": "",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
     return "".join(
-        c for c in str(text or "").upper()
+        c for c in text
         if c.isalnum()
     )
 
 
-TEAM_ALIASES = {
-    "SMU": ["SMU"],
+def similarity(a, b):
+    a = normalize(a)
+    b = normalize(b)
 
-    "FLORIDASTATE": [
-        "FSU",
-        "FLORIDASTATE"
-    ],
+    if not a or not b:
+        return 0
 
-    "FSU": [
-        "FSU",
-        "FLORIDASTATE"
-    ],
+    if a in b or b in a:
+        return 1.0
 
-    "FLORIDAAM": [
-        "FAMU",
-        "FLORIDAAM"
-    ],
-
-    "FAMU": [
-        "FAMU",
-        "FLORIDAAM"
-    ],
-
-    "MIAMI": [
-        "MIA",
-        "MIAMI"
-    ],
-
-    "MIAMIFL": [
-        "MIA",
-        "MIAMI",
-        "MIAMIFL"
-    ],
-
-    "AUBURN": [
-        "AUB",
-        "AUBURN"
-    ],
-
-    "ALABAMA": [
-        "BAMA",
-        "ALA",
-        "ALABAMA"
-    ],
-
-    "GEORGIA": [
-        "UGA",
-        "GEORGIA"
-    ],
-
-    "NOTREDAME": [
-        "ND",
-        "NOTREDAME"
-    ],
-
-    "OLEMISS": [
-        "MISS",
-        "OLEMISS"
-    ],
-
-    "LSU": ["LSU"],
-
-    "CLEMSON": [
-        "CLEM",
-        "CLEMSON"
-    ],
-
-    "TEXAS": [
-        "TEX",
-        "TEXAS"
-    ],
-
-    "TEXASAM": [
-        "TAMU",
-        "TEXASAM"
-    ],
-
-    "OHIOSTATE": [
-        "OSU",
-        "OHIOSTATE"
-    ],
-
-    "PENNSTATE": [
-        "PSU",
-        "PENNSTATE"
-    ],
-
-    "MICHIGAN": [
-        "MICH",
-        "MICHIGAN"
-    ],
-
-    "WISCONSIN": [
-        "WISC",
-        "WISCONSIN"
-    ],
-
-    "WASHINGTON": [
-        "WASH",
-        "WASHINGTON"
-    ],
-
-    "WASHINGTONSTATE": [
-        "WSU",
-        "WASHINGTONSTATE"
-    ],
-
-    "OREGON": [
-        "ORE",
-        "OREGON"
-    ]
-}
+    return SequenceMatcher(
+        None,
+        a,
+        b
+    ).ratio()
 
 
-def aliases_for(team):
-    key = normalize(team)
-
-    aliases = TEAM_ALIASES.get(key)
-
-    if aliases:
-        return [normalize(x) for x in aliases]
-
-    return [key]
+def event_text(event):
+    return " ".join([
+        str(event.get("title", "")),
+        str(event.get("sub_title", "")),
+        str(event.get("event_ticker", ""))
+    ])
 
 
-def game_market_text(m):
-    return normalize(
-        " ".join([
-            str(m.get("ticker", "")),
-            str(m.get("event_ticker", "")),
-            str(m.get("title", "")),
-            str(m.get("subtitle", "")),
-            str(m.get("yes_sub_title", "")),
-            str(m.get("no_sub_title", ""))
-        ])
+def matchup_score(event, team, opponent):
+    text = event_text(event)
+
+    team_score = similarity(
+        team,
+        text
     )
+
+    opponent_score = similarity(
+        opponent,
+        text
+    )
+
+    return team_score + opponent_score
 
 
 def discover_game_event(team, opponent, game_date):
@@ -214,56 +129,62 @@ def discover_game_event(team, opponent, game_date):
         "%y%b%d"
     ).upper()
 
-    team_aliases = aliases_for(team)
-    opponent_aliases = aliases_for(opponent)
-
     cursor = None
+    candidates = []
 
     for _ in range(20):
         params = {
             "series_ticker": "KXNCAAFGAME",
-            "limit": 1000
+            "limit": 200
         }
 
         if cursor:
             params["cursor"] = cursor
 
         data = kalshi_get(
-            "/markets",
+            "/events",
             params=params
         )
 
-        for m in data.get("markets", []):
-            ticker = str(
-                m.get("ticker", "")
+        for event in data.get("events", []):
+            event_ticker = str(
+                event.get("event_ticker", "")
             ).upper()
 
-            if date_code not in ticker:
+            if date_code not in event_ticker:
                 continue
 
-            text = game_market_text(m)
-
-            team_match = any(
-                alias in text
-                for alias in team_aliases
+            score = matchup_score(
+                event,
+                team,
+                opponent
             )
 
-            opponent_match = any(
-                alias in text
-                for alias in opponent_aliases
+            candidates.append(
+                (score, event)
             )
-
-            if team_match and opponent_match:
-                return m.get(
-                    "event_ticker"
-                )
 
         cursor = data.get("cursor")
 
         if not cursor:
             break
 
-    return None
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    best_score, best_event = candidates[0]
+
+    if best_score < 1.0:
+        return None
+
+    return best_event.get(
+        "event_ticker"
+    )
 
 
 def related_event_ticker(
@@ -273,13 +194,13 @@ def related_event_ticker(
     if not game_event:
         return None
 
-    if not game_event.startswith(
-        "KXNCAAFGAME-"
-    ):
+    prefix = "KXNCAAFGAME-"
+
+    if not game_event.startswith(prefix):
         return None
 
     suffix = game_event.split(
-        "KXNCAAFGAME-",
+        prefix,
         1
     )[1]
 
@@ -299,11 +220,11 @@ def related_event_ticker(
 @app.get("/market/<ticker>")
 def market(ticker):
     try:
-        data = kalshi_get(
-            f"/markets/{ticker}"
+        return jsonify(
+            kalshi_get(
+                f"/markets/{ticker}"
+            )
         )
-
-        return jsonify(data)
 
     except requests.RequestException as e:
         return jsonify(
@@ -345,10 +266,7 @@ def game():
 
     except ValueError:
         return jsonify(
-            error=(
-                "Date must use "
-                "YYYY-MM-DD format"
-            )
+            error="Date must use YYYY-MM-DD format"
         ), 400
 
     try:
@@ -358,67 +276,47 @@ def game():
             game_date
         )
 
-        spread_event = (
-            related_event_ticker(
-                game_event,
-                "spread"
-            )
+        spread_event = related_event_ticker(
+            game_event,
+            "spread"
         )
 
-        total_event = (
-            related_event_ticker(
-                game_event,
-                "total"
-            )
+        total_event = related_event_ticker(
+            game_event,
+            "total"
         )
 
         game_winner = (
-            get_event_markets(
-                game_event
-            )
-            if game_event
-            else []
+            get_event_markets(game_event)
+            if game_event else []
         )
 
         spreads = (
-            get_event_markets(
-                spread_event
-            )
-            if spread_event
-            else []
+            get_event_markets(spread_event)
+            if spread_event else []
         )
 
         totals = (
-            get_event_markets(
-                total_event
-            )
-            if total_event
-            else []
+            get_event_markets(total_event)
+            if total_event else []
         )
 
         return jsonify(
-            matchup=(
-                f"{team} vs {opponent}"
-            ),
-
+            matchup=f"{team} vs {opponent}",
             date=game_date,
-
             event_tickers={
                 "game": game_event,
                 "spread": spread_event,
                 "total": total_event
             },
-
             game_winner=[
                 compact_market(m)
                 for m in game_winner
             ],
-
             spread=[
                 compact_market(m)
                 for m in spreads
             ],
-
             total=[
                 compact_market(m)
                 for m in totals
@@ -449,21 +347,18 @@ def smu_today():
         return jsonify(
             matchup="SMU vs Florida State",
             date="2026-09-07",
-
             game_winner=[
                 compact_market(m)
                 for m in get_event_markets(
                     game_event
                 )
             ],
-
             spread=[
                 compact_market(m)
                 for m in get_event_markets(
                     spread_event
                 )
             ],
-
             total=[
                 compact_market(m)
                 for m in get_event_markets(
