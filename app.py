@@ -105,6 +105,34 @@ def search():
         return jsonify(error=str(e)), 502
 
 
+@app.get("/smu-debug")
+def smu_debug():
+    try:
+        markets = get_markets(max_pages=10)
+        matches = []
+
+        for m in markets:
+            text = searchable_text(m)
+
+            if "smu" in text:
+                matches.append({
+                    "ticker": m.get("ticker"),
+                    "event_ticker": m.get("event_ticker"),
+                    "title": m.get("title"),
+                    "subtitle": m.get("subtitle"),
+                    "open_time": m.get("open_time"),
+                    "close_time": m.get("close_time"),
+                    "expiration_time": m.get("expiration_time")
+                })
+
+        return jsonify(
+            count=len(matches),
+            markets=matches[:50]
+        )
+
+    except requests.RequestException as e:
+        return jsonify(error=str(e)), 502
+
 @app.get("/smu-today")
 def smu_today():
     try:
