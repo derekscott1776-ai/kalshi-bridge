@@ -1,4 +1,6 @@
 from flask import Flask, jsonify, request
+import os
+import math
 import requests
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -6,15 +8,22 @@ from difflib import SequenceMatcher
 app = Flask(__name__)
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+CFBD_BASE = "https://api.collegefootballdata.com"
+CFBD_API_KEY = os.environ.get("CFBD_API_KEY")
 
 
 @app.get("/")
 def home():
     return jsonify(
         status="ok",
-        message="Kalshi bridge is running"
+        message="Kalshi bridge is running",
+        cfbd_configured=bool(CFBD_API_KEY)
     )
 
+
+# -------------------------
+# KALSHI
+# -------------------------
 
 def kalshi_get(path, params=None):
     r = requests.get(
@@ -56,6 +65,10 @@ def compact_market(m):
         "close_time": m.get("close_time")
     }
 
+
+# -------------------------
+# TEXT MATCHING
+# -------------------------
 
 def normalize(text):
     text = str(text or "").lower()
@@ -105,18 +118,15 @@ def event_text(event):
 def matchup_score(event, team, opponent):
     text = event_text(event)
 
-    team_score = similarity(
-        team,
-        text
+    return (
+        similarity(team, text)
+        + similarity(opponent, text)
     )
 
-    opponent_score = similarity(
-        opponent,
-        text
-    )
 
-    return team_score + opponent_score
-
+# -------------------------
+# KALSHI EVENT DISCOVERY
+# -------------------------
 
 def discover_game_event(team, opponent, game_date):
     date_obj = datetime.strptime(
@@ -209,6 +219,175 @@ def related_event_ticker(game_event, market_type):
     return game_event
 
 
+# -------------------------
+# CFBD PROBABILITY ENGINE
+# -------------------------
+
+def cfbd_get(path, params=None):
+    if not CFBD_API_KEY:
+        raise RuntimeError(
+            "CFBD_API_KEY is not configured"
+        )
+
+    r = requests.get(
+        f"{CFBD_BASE}{path}",
+        params=params,
+        headers={
+            "Authorization": (
+                f"Bearer {CFBD_API_KEY}"
+            )
+        },
+        timeout=20
+    )
+
+    r.raise_for_status()
+    return r.json()
+
+
+def get_team_elo(team, year):
+    data = cfbd_get(
+        "/ratings/elo",
+        params={
+            "year": year,
+            "team": team
+        }
+    )
+
+    if not data:
+        return None
+
+    best = None
+    best_score = -1
+
+    for row in data:
+        score = similarity(
+            team,
+            row.get("team")
+        )
+
+        if score > best_score:
+            best_score = score
+            best = row
+
+    if not best:
+        return None
+
+    elo = best.get("elo")
+
+    if elo is None:
+        return None
+
+    return {
+        "requested_team": team,
+        "matched_team": best.get("team"),
+        "conference": best.get("conference"),
+        "elo": float(elo)
+    }
+
+
+def elo_win_probability(
+    team_elo,
+    opponent_elo
+):
+    rating_difference = (
+        team_elo - opponent_elo
+    )
+
+    probability = (
+        1.0
+        / (
+            1.0
+            + math.pow(
+                10.0,
+                -rating_difference / 400.0
+            )
+        )
+    )
+
+    return probability
+
+
+def build_probability_model(
+    team,
+    opponent,
+    game_date
+):
+    year = datetime.strptime(
+        game_date,
+        "%Y-%m-%d"
+    ).year
+
+    team_rating = get_team_elo(
+        team,
+        year
+    )
+
+    opponent_rating = get_team_elo(
+        opponent,
+        year
+    )
+
+    if (
+        team_rating is None
+        or opponent_rating is None
+    ):
+        return {
+            "available": False,
+            "model": "CFBD Elo baseline",
+            "reason": (
+                "Could not retrieve an Elo "
+                "rating for both teams."
+            )
+        }
+
+    team_probability = elo_win_probability(
+        team_rating["elo"],
+        opponent_rating["elo"]
+    )
+
+    opponent_probability = (
+        1.0 - team_probability
+    )
+
+    return {
+        "available": True,
+        "model": "CFBD Elo baseline",
+        "season": year,
+        "team": team_rating,
+        "opponent": opponent_rating,
+        "rating_difference": round(
+            team_rating["elo"]
+            - opponent_rating["elo"],
+            2
+        ),
+        "team_fair_probability": round(
+            team_probability,
+            6
+        ),
+        "opponent_fair_probability": round(
+            opponent_probability,
+            6
+        ),
+        "team_fair_probability_percent": round(
+            team_probability * 100,
+            2
+        ),
+        "opponent_fair_probability_percent": round(
+            opponent_probability * 100,
+            2
+        ),
+        "notes": (
+            "Baseline independent probability "
+            "derived only from CFBD Elo ratings. "
+            "Kalshi prices are not inputs."
+        )
+    }
+
+
+# -------------------------
+# VALUE / EV MATH
+# -------------------------
+
 def number(value):
     try:
         return float(value)
@@ -228,7 +407,10 @@ def clamp_probability(value):
     return value
 
 
-def expected_metrics(fair_probability, entry_price):
+def expected_metrics(
+    fair_probability,
+    entry_price
+):
     fair_probability = clamp_probability(
         fair_probability
     )
@@ -246,18 +428,21 @@ def expected_metrics(fair_probability, entry_price):
     if entry_price <= 0 or entry_price >= 1:
         return None
 
-    edge = fair_probability - entry_price
+    edge = (
+        fair_probability
+        - entry_price
+    )
 
-    expected_profit_per_contract = edge
-
-    expected_roi = edge / entry_price
+    expected_roi = (
+        edge / entry_price
+    )
 
     return {
         "fair_probability": round(
             fair_probability,
             4
         ),
-        "market_probability": round(
+        "entry_price": round(
             entry_price,
             4
         ),
@@ -270,7 +455,7 @@ def expected_metrics(fair_probability, entry_price):
             2
         ),
         "expected_profit_per_contract": round(
-            expected_profit_per_contract,
+            edge,
             4
         ),
         "expected_roi": round(
@@ -337,19 +522,9 @@ def analysis_market(
     )
 
     fair_no = (
-        round(1 - fair_yes, 6)
+        1.0 - fair_yes
         if fair_yes is not None
         else None
-    )
-
-    yes_evaluation = expected_metrics(
-        fair_yes,
-        yes_ask
-    )
-
-    no_evaluation = expected_metrics(
-        fair_no,
-        no_ask
     )
 
     return {
@@ -369,8 +544,14 @@ def analysis_market(
         "fair_probability_supplied": (
             fair_yes is not None
         ),
-        "yes_evaluation": yes_evaluation,
-        "no_evaluation": no_evaluation
+        "yes_evaluation": expected_metrics(
+            fair_yes,
+            yes_ask
+        ),
+        "no_evaluation": expected_metrics(
+            fair_no,
+            no_ask
+        )
     }
 
 
@@ -388,14 +569,10 @@ def analysis_candidates(
     for m in markets:
         ticker = m.get("ticker")
 
-        fair_yes = fair_probabilities.get(
-            ticker
-        )
-
         item = analysis_market(
             m,
             market_type,
-            fair_yes
+            fair_probabilities.get(ticker)
         )
 
         if (
@@ -424,7 +601,15 @@ def analysis_candidates(
     return results
 
 
-def build_game_data(team, opponent, game_date):
+# -------------------------
+# GAME DATA
+# -------------------------
+
+def build_game_data(
+    team,
+    opponent,
+    game_date
+):
     game_event = discover_game_event(
         team,
         opponent,
@@ -466,7 +651,11 @@ def build_game_data(team, opponent, game_date):
     }
 
 
-def validate_values(team, opponent, game_date):
+def validate_values(
+    team,
+    opponent,
+    game_date
+):
     if not team or not opponent or not game_date:
         return (
             False,
@@ -478,6 +667,7 @@ def validate_values(team, opponent, game_date):
             game_date,
             "%Y-%m-%d"
         )
+
     except ValueError:
         return (
             False,
@@ -487,66 +677,69 @@ def validate_values(team, opponent, game_date):
     return True, None
 
 
-def read_analyze_request():
-    if request.method == "POST":
-        payload = request.get_json(
-            silent=True
-        ) or {}
+def find_winner_fair_probabilities(
+    markets,
+    team,
+    opponent,
+    probability_model
+):
+    probabilities = {}
 
-        team = str(
-            payload.get("team", "")
-        ).strip()
+    if not probability_model.get(
+        "available"
+    ):
+        return probabilities
 
-        opponent = str(
-            payload.get("opponent", "")
-        ).strip()
-
-        game_date = str(
-            payload.get("date", "")
-        ).strip()
-
-        fair_probabilities = (
-            payload.get(
-                "fair_probabilities",
-                {}
-            )
-        )
-
-        if not isinstance(
-            fair_probabilities,
-            dict
-        ):
-            fair_probabilities = {}
-
-        return (
-            team,
-            opponent,
-            game_date,
-            fair_probabilities
-        )
-
-    team = request.args.get(
-        "team",
-        ""
-    ).strip()
-
-    opponent = request.args.get(
-        "opponent",
-        ""
-    ).strip()
-
-    game_date = request.args.get(
-        "date",
-        ""
-    ).strip()
-
-    return (
-        team,
-        opponent,
-        game_date,
-        {}
+    team_probability = (
+        probability_model[
+            "team_fair_probability"
+        ]
     )
 
+    opponent_probability = (
+        probability_model[
+            "opponent_fair_probability"
+        ]
+    )
+
+    for market in markets:
+        ticker = market.get("ticker")
+        title = str(
+            market.get("title", "")
+        )
+
+        team_score = similarity(
+            team,
+            title
+        )
+
+        opponent_score = similarity(
+            opponent,
+            title
+        )
+
+        if (
+            team_score >= 0.75
+            and team_score > opponent_score
+        ):
+            probabilities[ticker] = (
+                team_probability
+            )
+
+        elif (
+            opponent_score >= 0.75
+            and opponent_score > team_score
+        ):
+            probabilities[ticker] = (
+                opponent_probability
+            )
+
+    return probabilities
+
+
+# -------------------------
+# ROUTES
+# -------------------------
 
 @app.get("/market/<ticker>")
 def market(ticker):
@@ -559,6 +752,41 @@ def market(ticker):
 
     except requests.RequestException as e:
         return jsonify(
+            error=str(e)
+        ), 502
+
+
+@app.get("/cfbd-test")
+def cfbd_test():
+    if not CFBD_API_KEY:
+        return jsonify(
+            configured=False,
+            error="CFBD_API_KEY is missing"
+        ), 500
+
+    try:
+        data = cfbd_get(
+            "/ratings/elo",
+            params={
+                "year": 2026,
+                "team": "Rutgers"
+            }
+        )
+
+        return jsonify(
+            configured=True,
+            success=True,
+            records=len(data),
+            sample=(
+                data[0]
+                if data else None
+            )
+        )
+
+    except requests.RequestException as e:
+        return jsonify(
+            configured=True,
+            success=False,
             error=str(e)
         ), 502
 
@@ -626,17 +854,22 @@ def game():
         ), 502
 
 
-@app.route(
-    "/analyze",
-    methods=["GET", "POST"]
-)
+@app.get("/analyze")
 def analyze():
-    (
-        team,
-        opponent,
-        game_date,
-        fair_probabilities
-    ) = read_analyze_request()
+    team = request.args.get(
+        "team",
+        ""
+    ).strip()
+
+    opponent = request.args.get(
+        "opponent",
+        ""
+    ).strip()
+
+    game_date = request.args.get(
+        "date",
+        ""
+    ).strip()
 
     valid, message = validate_values(
         team,
@@ -658,80 +891,97 @@ def analyze():
 
         if not data["game_event"]:
             return jsonify(
+                found=False,
                 matchup=f"{team} vs {opponent}",
                 date=game_date,
-                found=False,
                 message=(
                     "No matching Kalshi "
                     "college football event found."
                 )
             ), 404
 
-        winner_candidates = analysis_candidates(
-            data["game_winner"],
-            "winner",
-            fair_probabilities
+        probability_model = (
+            build_probability_model(
+                team,
+                opponent,
+                game_date
+            )
         )
 
-        spread_candidates = analysis_candidates(
-            data["spread"],
-            "spread",
-            fair_probabilities
+        winner_probabilities = (
+            find_winner_fair_probabilities(
+                data["game_winner"],
+                team,
+                opponent,
+                probability_model
+            )
         )
 
-        total_candidates = analysis_candidates(
-            data["total"],
-            "total",
-            fair_probabilities
+        winner_candidates = (
+            analysis_candidates(
+                data["game_winner"],
+                "winner",
+                winner_probabilities
+            )
         )
 
-        supplied_count = sum(
-            1
-            for group in [
-                winner_candidates,
-                spread_candidates,
-                total_candidates
-            ]
-            for item in group
-            if item[
-                "fair_probability_supplied"
-            ]
+        spread_candidates = (
+            analysis_candidates(
+                data["spread"],
+                "spread"
+            )
+        )
+
+        total_candidates = (
+            analysis_candidates(
+                data["total"],
+                "total"
+            )
         )
 
         return jsonify(
             found=True,
             matchup=f"{team} vs {opponent}",
             date=game_date,
-            event_tickers={
-                "game": data["game_event"],
-                "spread": data["spread_event"],
-                "total": data["total_event"]
-            },
+            probability_model=(
+                probability_model
+            ),
             methodology={
-                "fair_probability": (
-                    "Must be supplied externally. "
-                    "Kalshi prices are not used "
-                    "to create the fair probability."
+                "probability_source": (
+                    "Independent CFBD Elo "
+                    "ratings."
                 ),
-                "market_probability": (
-                    "Current executable ask price."
+                "kalshi_role": (
+                    "Kalshi prices are used "
+                    "only after fair probability "
+                    "is calculated."
                 ),
                 "edge": (
-                    "Fair probability minus "
-                    "entry price."
+                    "Independent fair probability "
+                    "minus executable ask price."
                 ),
-                "expected_profit_per_contract": (
+                "expected_profit": (
                     "Fair probability minus "
                     "contract cost."
                 ),
                 "expected_roi": (
                     "Expected profit divided "
                     "by contract cost."
+                ),
+                "limitations": (
+                    "Version 1 is an Elo-only "
+                    "baseline. It does not yet "
+                    "adjust for venue, injuries, "
+                    "weather, matchup efficiency, "
+                    "roster changes, fees, or "
+                    "slippage."
                 )
             },
-            fair_probabilities_received=(
-                supplied_count
-            ),
+            event_tickers={
+                "game": data["game_event"],
+                "spread": data["spread_event"],
+                "total": data["total_event"]
+            },
             summary={
                 "winner_contracts": len(
                     winner_candidates
@@ -741,12 +991,20 @@ def analyze():
                 ),
                 "total_contracts": len(
                     total_candidates
+                ),
+                "winner_contracts_with_model": (
+                    len(winner_probabilities)
                 )
             },
             winner=winner_candidates,
             spread=spread_candidates,
             total=total_candidates
         )
+
+    except RuntimeError as e:
+        return jsonify(
+            error=str(e)
+        ), 500
 
     except requests.RequestException as e:
         return jsonify(
@@ -796,4 +1054,3 @@ def smu_today():
         return jsonify(
             error=str(e)
         ), 502
-        
