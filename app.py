@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request
 import requests
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -19,7 +20,7 @@ def market(ticker):
     try:
         r = requests.get(
             f"{KALSHI_BASE}/markets/{ticker}",
-            timeout=10
+            timeout=15
         )
         return (
             r.text,
@@ -30,99 +31,155 @@ def market(ticker):
         return jsonify(error=str(e)), 502
 
 
-@app.get("/markets")
-def markets():
-    try:
-        params = {"limit": 1000}
+def get_markets(max_pages=10):
+    markets = []
+    cursor = None
 
-        status = request.args.get("status")
-        series_ticker = request.args.get("series_ticker")
-        event_ticker = request.args.get("event_ticker")
+    for _ in range(max_pages):
+        params = {
+            "limit": 1000
+        }
 
-        if status:
-            params["status"] = status
-        if series_ticker:
-            params["series_ticker"] = series_ticker
-        if event_ticker:
-            params["event_ticker"] = event_ticker
+        if cursor:
+            params["cursor"] = cursor
 
         r = requests.get(
             f"{KALSHI_BASE}/markets",
             params=params,
-            timeout=15
+            timeout=20
         )
+        r.raise_for_status()
 
-        return (
-            r.text,
-            r.status_code,
-            {"Content-Type": "application/json"}
+        data = r.json()
+        markets.extend(data.get("markets", []))
+
+        cursor = data.get("cursor")
+
+        if not cursor:
+            break
+
+    return markets
+
+
+def searchable_text(market):
+    fields = [
+        market.get("ticker", ""),
+        market.get("event_ticker", ""),
+        market.get("title", ""),
+        market.get("subtitle", ""),
+        market.get("yes_sub_title", ""),
+        market.get("no_sub_title", ""),
+        market.get("rules_primary", ""),
+        market.get("custom_strike", {})
+    ]
+
+    return " ".join(str(x) for x in fields).lower()
+
+
+@app.get("/search")
+def search():
+    query = request.args.get("q", "").strip()
+
+    if not query:
+        return jsonify(
+            error="Use /search?q=SMU"
+        ), 400
+
+    try:
+        markets = get_markets(max_pages=5)
+        q = query.lower()
+
+        matches = [
+            market for market in markets
+            if q in searchable_text(market)
+        ]
+
+        return jsonify(
+            query=query,
+            count=len(matches),
+            pages_checked=5,
+            markets=matches
         )
 
     except requests.RequestException as e:
         return jsonify(error=str(e)), 502
 
 
-@app.get("/search")
-def search():
-    query = request.args.get("q", "").strip().lower()
-
-    if not query:
-        return jsonify(
-            error="Add a search term, for example /search?q=football"
-        ), 400
-
+@app.get("/smu-today")
+def smu_today():
     try:
-        matches = []
-        cursor = None
-        pages_checked = 0
-        max_pages = 5
+        markets = get_markets(max_pages=10)
 
-        while pages_checked < max_pages:
-            params = {
-                "limit": 1000,
-                "status": "open"
+        today = datetime.now(timezone.utc).date()
+
+        smu = []
+
+        for market in markets:
+            text = searchable_text(market)
+
+            if "smu" not in text:
+                continue
+
+            close_time = market.get("close_time", "")
+
+            try:
+                market_date = datetime.fromisoformat(
+                    close_time.replace("Z", "+00:00")
+                ).date()
+            except (ValueError, TypeError):
+                continue
+
+            if market_date != today:
+                continue
+
+            smu.append(market)
+
+        winner = []
+        spread = []
+        total = []
+
+        for market in smu:
+            text = searchable_text(market)
+
+            if any(x in text for x in [
+                "spread",
+                "point spread",
+                "margin"
+            ]):
+                spread.append(market)
+
+            elif any(x in text for x in [
+                "total",
+                "over",
+                "under",
+                "points scored"
+            ]):
+                total.append(market)
+
+            else:
+                winner.append(market)
+
+        def compact(m):
+            return {
+                "ticker": m.get("ticker"),
+                "event_ticker": m.get("event_ticker"),
+                "title": m.get("title"),
+                "subtitle": m.get("subtitle"),
+                "yes_bid": m.get("yes_bid"),
+                "yes_ask": m.get("yes_ask"),
+                "no_bid": m.get("no_bid"),
+                "no_ask": m.get("no_ask"),
+                "last_price": m.get("last_price"),
+                "close_time": m.get("close_time")
             }
 
-            if cursor:
-                params["cursor"] = cursor
-
-            r = requests.get(
-                f"{KALSHI_BASE}/markets",
-                params=params,
-                timeout=10
-            )
-            r.raise_for_status()
-
-            data = r.json()
-            pages_checked += 1
-
-            for market in data.get("markets", []):
-                searchable = " ".join([
-                    str(market.get("ticker", "")),
-                    str(market.get("event_ticker", "")),
-                    str(market.get("title", "")),
-                    str(market.get("subtitle", "")),
-                    str(market.get("yes_sub_title", "")),
-                    str(market.get("no_sub_title", ""))
-                ]).lower()
-
-                if query in searchable:
-                    matches.append(market)
-
-            cursor = data.get("cursor")
-
-            if not cursor:
-                break
-
         return jsonify(
-            query=query,
-            count=len(matches),
-            pages_checked=pages_checked,
-            markets=matches
+            date=str(today),
+            team="SMU",
+            game_winner=[compact(x) for x in winner],
+            spread=[compact(x) for x in spread],
+            total=[compact(x) for x in total]
         )
 
     except requests.RequestException as e:
-        return jsonify(
-            error=str(e),
-            pages_checked=pages_checked
-        ), 502
+        return jsonify(error=str(e)), 502
