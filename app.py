@@ -60,12 +60,49 @@ def compact_market(m):
 
 
 def normalize(text):
-    return " ".join(
-        str(text or "").lower().replace("-", " ").split()
+    return "".join(
+        c for c in str(text or "").upper()
+        if c.isalnum()
     )
 
 
-def market_text(m):
+TEAM_ALIASES = {
+    "SMU": ["SMU"],
+    "FLORIDASTATE": ["FSU", "FLORIDASTATE"],
+    "FSU": ["FSU", "FLORIDASTATE"],
+    "AUBURN": ["AUB", "AUBURN"],
+    "ALABAMA": ["BAMA", "ALA", "ALABAMA"],
+    "GEORGIA": ["UGA", "GEORGIA"],
+    "NOTREDAME": ["ND", "NOTREDAME"],
+    "OLEMISS": ["MISS", "OLEMISS"],
+    "LSU": ["LSU"],
+    "CLEMSON": ["CLEM", "CLEMSON"],
+    "TEXAS": ["TEX", "TEXAS"],
+    "TEXASA&M": ["TAMU", "TEXASAM"],
+    "TEXASAM": ["TAMU", "TEXASAM"],
+    "OHIOSTATE": ["OSU", "OHIOSTATE"],
+    "PENNST": ["PSU", "PENNSTATE"],
+    "PENNSTATE": ["PSU", "PENNSTATE"],
+    "MICHIGAN": ["MICH", "MICHIGAN"],
+    "WISCONSIN": ["WISC", "WISCONSIN"],
+    "WASHINGTON": ["WASH", "WASHINGTON"],
+    "WASHINGTONSTATE": ["WSU", "WASHINGTONSTATE"],
+    "OREGON": ["ORE", "OREGON"]
+}
+
+
+def aliases_for(team):
+    key = normalize(team)
+
+    aliases = TEAM_ALIASES.get(key)
+
+    if aliases:
+        return [normalize(x) for x in aliases]
+
+    return [key]
+
+
+def game_market_text(m):
     return normalize(
         " ".join([
             str(m.get("ticker", "")),
@@ -78,82 +115,80 @@ def market_text(m):
     )
 
 
-def discover_game_events(team, opponent, game_date):
+def discover_game_event(team, opponent, game_date):
     date_obj = datetime.strptime(game_date, "%Y-%m-%d")
     date_code = date_obj.strftime("%y%b%d").upper()
 
-    prefixes = [
-        "KXNCAAFGAME",
-        "KXNCAAFSPREAD",
-        "KXNCAAFTOTAL"
-    ]
+    team_aliases = aliases_for(team)
+    opponent_aliases = aliases_for(opponent)
 
-    found = {
-        "game": None,
-        "spread": None,
-        "total": None
-    }
+    cursor = None
 
-    team_q = normalize(team)
-    opponent_q = normalize(opponent)
+    for _ in range(20):
+        params = {
+            "series_ticker": "KXNCAAFGAME",
+            "limit": 1000
+        }
 
-    for prefix in prefixes:
-        cursor = None
+        if cursor:
+            params["cursor"] = cursor
 
-        for _ in range(10):
-            params = {
-                "series_ticker": prefix,
-                "limit": 1000
-            }
+        data = kalshi_get("/markets", params=params)
 
-            if cursor:
-                params["cursor"] = cursor
+        for m in data.get("markets", []):
+            ticker = str(m.get("ticker", "")).upper()
 
-            data = kalshi_get("/markets", params=params)
+            if date_code not in ticker:
+                continue
 
-            for m in data.get("markets", []):
-                text = market_text(m)
-                ticker = str(m.get("ticker", "")).upper()
+            text = game_market_text(m)
 
-                if date_code not in ticker:
-                    continue
+            team_match = any(
+                alias in text for alias in team_aliases
+            )
 
-                if team_q not in text:
-                    continue
+            opponent_match = any(
+                alias in text for alias in opponent_aliases
+            )
 
-                if opponent_q not in text:
-                    continue
+            if team_match and opponent_match:
+                return m.get("event_ticker")
 
-                event_ticker = m.get("event_ticker")
+        cursor = data.get("cursor")
 
-                if prefix == "KXNCAAFGAME":
-                    found["game"] = event_ticker
-                elif prefix == "KXNCAAFSPREAD":
-                    found["spread"] = event_ticker
-                elif prefix == "KXNCAAFTOTAL":
-                    found["total"] = event_ticker
+        if not cursor:
+            break
 
-                break
+    return None
 
-            if (
-                (prefix == "KXNCAAFGAME" and found["game"]) or
-                (prefix == "KXNCAAFSPREAD" and found["spread"]) or
-                (prefix == "KXNCAAFTOTAL" and found["total"])
-            ):
-                break
 
-            cursor = data.get("cursor")
+def related_event_ticker(game_event, market_type):
+    if not game_event:
+        return None
 
-            if not cursor:
-                break
+    if not game_event.startswith("KXNCAAFGAME-"):
+        return None
 
-    return found
+    suffix = game_event.split(
+        "KXNCAAFGAME-",
+        1
+    )[1]
+
+    if market_type == "spread":
+        return f"KXNCAAFSPREAD-{suffix}"
+
+    if market_type == "total":
+        return f"KXNCAAFTOTAL-{suffix}"
+
+    return game_event
 
 
 @app.get("/market/<ticker>")
 def market(ticker):
     try:
-        data = kalshi_get(f"/markets/{ticker}")
+        data = kalshi_get(
+            f"/markets/{ticker}"
+        )
         return jsonify(data)
 
     except requests.RequestException as e:
@@ -162,56 +197,95 @@ def market(ticker):
 
 @app.get("/game")
 def game():
-    team = request.args.get("team", "").strip()
-    opponent = request.args.get("opponent", "").strip()
-    game_date = request.args.get("date", "").strip()
+    team = request.args.get(
+        "team",
+        ""
+    ).strip()
+
+    opponent = request.args.get(
+        "opponent",
+        ""
+    ).strip()
+
+    game_date = request.args.get(
+        "date",
+        ""
+    ).strip()
 
     if not team or not opponent or not game_date:
         return jsonify(
-            error="Use /game?team=SMU&opponent=Florida%20State&date=2026-09-07"
+            error=(
+                "Use /game?team=SMU"
+                "&opponent=Florida%20State"
+                "&date=2026-09-07"
+            )
         ), 400
 
     try:
-        datetime.strptime(game_date, "%Y-%m-%d")
+        datetime.strptime(
+            game_date,
+            "%Y-%m-%d"
+        )
     except ValueError:
         return jsonify(
             error="Date must use YYYY-MM-DD format"
         ), 400
 
     try:
-        events = discover_game_events(
+        game_event = discover_game_event(
             team,
             opponent,
             game_date
         )
 
+        spread_event = related_event_ticker(
+            game_event,
+            "spread"
+        )
+
+        total_event = related_event_ticker(
+            game_event,
+            "total"
+        )
+
         game_winner = (
-            get_event_markets(events["game"])
-            if events["game"] else []
+            get_event_markets(game_event)
+            if game_event else []
         )
 
         spreads = (
-            get_event_markets(events["spread"])
-            if events["spread"] else []
+            get_event_markets(spread_event)
+            if spread_event else []
         )
 
         totals = (
-            get_event_markets(events["total"])
-            if events["total"] else []
+            get_event_markets(total_event)
+            if total_event else []
         )
 
         return jsonify(
             matchup=f"{team} vs {opponent}",
             date=game_date,
-            event_tickers=events,
+
+            event_tickers={
+                "game": game_event,
+                "spread": spread_event,
+                "total": total_event
+            },
+
             game_winner=[
-                compact_market(m) for m in game_winner
+                compact_market(m)
+                for m in game_winner
             ],
+
             spread=[
-                compact_market(m) for m in spreads
+                compact_market(m)
+                for m in spreads
             ],
+
             total=[
-                compact_market(m) for m in totals
+                compact_market(m)
+                for m in totals
             ]
         )
 
@@ -222,24 +296,41 @@ def game():
 @app.get("/smu-today")
 def smu_today():
     try:
-        game_event = "KXNCAAFGAME-26SEP07SMUFSU"
-        spread_event = "KXNCAAFSPREAD-26SEP07SMUFSU"
-        total_event = "KXNCAAFTOTAL-26SEP07SMUFSU"
+        game_event = (
+            "KXNCAAFGAME-26SEP07SMUFSU"
+        )
+
+        spread_event = (
+            "KXNCAAFSPREAD-26SEP07SMUFSU"
+        )
+
+        total_event = (
+            "KXNCAAFTOTAL-26SEP07SMUFSU"
+        )
 
         return jsonify(
             matchup="SMU vs Florida State",
             date="2026-09-07",
+
             game_winner=[
                 compact_market(m)
-                for m in get_event_markets(game_event)
+                for m in get_event_markets(
+                    game_event
+                )
             ],
+
             spread=[
                 compact_market(m)
-                for m in get_event_markets(spread_event)
+                for m in get_event_markets(
+                    spread_event
+                )
             ],
+
             total=[
                 compact_market(m)
-                for m in get_event_markets(total_event)
+                for m in get_event_markets(
+                    total_event
+                )
             ]
         )
 
