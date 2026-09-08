@@ -2760,72 +2760,125 @@ def analysis_candidates(
     return results
 
 
+def winner_contract_identity_text(market):
+    """
+    Build text that identifies the outcome represented by YES.
+
+    Kalshi winner-market titles can contain both teams (for example,
+    "Will Missouri win the Missouri vs Kansas college football game?").
+    Matching against the title alone is therefore ambiguous. Prefer
+    outcome-specific subtitle fields and the contract ticker suffix.
+    """
+    ticker = str(market.get("ticker", ""))
+    ticker_suffix = ticker.rsplit("-", 1)[-1] if "-" in ticker else ticker
+
+    parts = [
+        market.get("yes_sub_title", ""),
+        market.get("yes_subtitle", ""),
+        market.get("subtitle", ""),
+        market.get("sub_title", ""),
+        ticker_suffix,
+    ]
+
+    return " ".join(
+        str(part).strip()
+        for part in parts
+        if str(part or "").strip()
+    )
+
+
+def winner_identity_score(team_name, market):
+    """Score how strongly a winner contract's YES side identifies a team."""
+    team_name = str(team_name or "").strip()
+    if not team_name:
+        return 0.0
+
+    fields = [
+        market.get("yes_sub_title", ""),
+        market.get("yes_subtitle", ""),
+        market.get("subtitle", ""),
+        market.get("sub_title", ""),
+    ]
+
+    scores = [
+        similarity(team_name, field)
+        for field in fields
+        if str(field or "").strip()
+    ]
+
+    ticker = str(market.get("ticker", ""))
+    ticker_suffix = ticker.rsplit("-", 1)[-1] if "-" in ticker else ticker
+    if ticker_suffix:
+        scores.append(similarity(team_name, ticker_suffix))
+
+    return max(scores) if scores else 0.0
+
+
 def find_winner_fair_probabilities(
     markets,
     team,
     opponent,
     probability_model
 ):
+    """
+    Map each Kalshi winner contract to the correct model probability.
+
+    Important: do not identify a contract from its generic game title,
+    because that title often contains both team names. We first use
+    outcome-specific Kalshi metadata (YES subtitle/subtitle/ticker suffix).
+    If there are exactly two winner contracts, we then resolve them as a
+    pair so each team receives one distinct contract.
+    """
     probabilities = {}
 
-    if not probability_model.get(
-        "available"
-    ):
+    if not probability_model.get("available"):
         return probabilities
 
-    team_probability = (
-        probability_model[
-            "team_fair_probability"
-        ]
-    )
+    team_probability = probability_model["team_fair_probability"]
+    opponent_probability = probability_model["opponent_fair_probability"]
 
-    opponent_probability = (
-        probability_model[
-            "opponent_fair_probability"
-        ]
-    )
+    scored = []
 
     for market in markets:
-        ticker = market.get(
-            "ticker"
+        ticker = market.get("ticker")
+        if not ticker:
+            continue
+
+        team_score = winner_identity_score(team, market)
+        opponent_score = winner_identity_score(opponent, market)
+
+        scored.append({
+            "ticker": ticker,
+            "market": market,
+            "team_score": team_score,
+            "opponent_score": opponent_score,
+        })
+
+        # Strong, unambiguous outcome-specific match.
+        if team_score >= 0.75 and team_score > opponent_score + 0.10:
+            probabilities[ticker] = team_probability
+        elif opponent_score >= 0.75 and opponent_score > team_score + 0.10:
+            probabilities[ticker] = opponent_probability
+
+    # Winner events normally contain one YES contract per team. If the
+    # metadata was abbreviated (e.g. MIZZ / KU), solve the two-contract
+    # assignment jointly rather than falling back to the ambiguous title.
+    if len(scored) == 2 and len(probabilities) < 2:
+        first, second = scored
+
+        assignment_a = (
+            first["team_score"] + second["opponent_score"]
+        )
+        assignment_b = (
+            first["opponent_score"] + second["team_score"]
         )
 
-        title = str(
-            market.get(
-                "title",
-                ""
-            )
-        )
-
-        team_score = similarity(
-            team,
-            title
-        )
-
-        opponent_score = similarity(
-            opponent,
-            title
-        )
-
-        if (
-            team_score >= 0.75
-            and
-            team_score
-            > opponent_score
-        ):
-            probabilities[
-                ticker
-            ] = team_probability
-
-        elif (
-            opponent_score >= 0.75
-            and
-            opponent_score
-            > team_score
-        ):
-            probabilities[
-                ticker
-            ] = opponent_probability
+        if assignment_a > assignment_b:
+            probabilities[first["ticker"]] = team_probability
+            probabilities[second["ticker"]] = opponent_probability
+        elif assignment_b > assignment_a:
+            probabilities[first["ticker"]] = opponent_probability
+            probabilities[second["ticker"]] = team_probability
 
     return probabilities
 
