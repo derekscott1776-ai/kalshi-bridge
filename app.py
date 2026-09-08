@@ -2431,3 +2431,579 @@ def out_of_sample_home_field():
             error=str(e)
         ), 502
 
+
+# ============================================================
+# OUT-OF-SAMPLE ELO CURVE VALIDATION
+# Fits BOTH home-field advantage and the Elo probability
+# curve scale on 2021-2024, then evaluates on unseen 2025.
+# This endpoint DOES NOT change the live model automatically.
+# ============================================================
+
+def elo_probability_with_scale(
+    rating_difference,
+    scale
+):
+    return (
+        1.0
+        /
+        (
+            1.0
+            + math.pow(
+                10.0,
+                -rating_difference
+                / scale
+            )
+        )
+    )
+
+
+def elo_model_metrics(
+    games,
+    home_field_elo,
+    scale
+):
+    if not games:
+        return {
+            "log_loss": None,
+            "brier_score": None
+        }
+
+    total_log_loss = 0.0
+    total_brier = 0.0
+
+    for game in games:
+        rating_difference = (
+            game["home_elo"]
+            - game["away_elo"]
+            + home_field_elo
+        )
+
+        probability = (
+            elo_probability_with_scale(
+                rating_difference,
+                scale
+            )
+        )
+
+        probability = max(
+            0.000001,
+            min(
+                0.999999,
+                probability
+            )
+        )
+
+        actual = game["home_win"]
+
+        total_log_loss += -(
+            actual * math.log(probability)
+            +
+            (1 - actual)
+            * math.log(1 - probability)
+        )
+
+        total_brier += (
+            probability - actual
+        ) ** 2
+
+    sample_size = len(games)
+
+    return {
+        "log_loss": (
+            total_log_loss
+            / sample_size
+        ),
+        "brier_score": (
+            total_brier
+            / sample_size
+        )
+    }
+
+
+def fit_elo_curve(
+    games
+):
+    best_hfa = None
+    best_scale = None
+    best_loss = None
+
+    # Stage 1: coarse search.
+    # HFA: 0 to 120 in 5-point steps
+    # Scale: 250 to 550 in 10-point steps
+    for hfa in range(
+        0,
+        121,
+        5
+    ):
+        for scale in range(
+            250,
+            551,
+            10
+        ):
+            metrics = elo_model_metrics(
+                games,
+                float(hfa),
+                float(scale)
+            )
+
+            loss = metrics["log_loss"]
+
+            if (
+                best_loss is None
+                or loss < best_loss
+            ):
+                best_loss = loss
+                best_hfa = float(hfa)
+                best_scale = float(scale)
+
+    # Stage 2: refine around the coarse optimum.
+    hfa_start = max(
+        0,
+        int(best_hfa - 10)
+    )
+    hfa_end = min(
+        150,
+        int(best_hfa + 10)
+    )
+
+    scale_start = max(
+        150,
+        int(best_scale - 20)
+    )
+    scale_end = min(
+        700,
+        int(best_scale + 20)
+    )
+
+    for hfa in range(
+        hfa_start,
+        hfa_end + 1,
+        1
+    ):
+        for scale in range(
+            scale_start,
+            scale_end + 1,
+            2
+        ):
+            metrics = elo_model_metrics(
+                games,
+                float(hfa),
+                float(scale)
+            )
+
+            loss = metrics["log_loss"]
+
+            if loss < best_loss:
+                best_loss = loss
+                best_hfa = float(hfa)
+                best_scale = float(scale)
+
+    return (
+        best_hfa,
+        best_scale,
+        best_loss
+    )
+
+
+def elo_calibration_buckets(
+    games,
+    home_field_elo,
+    scale
+):
+    buckets = {}
+
+    for start_pct in range(
+        0,
+        100,
+        10
+    ):
+        key = (
+            f"{start_pct:02d}-"
+            f"{start_pct + 10:02d}%"
+        )
+
+        buckets[key] = {
+            "count": 0,
+            "predicted_sum": 0.0,
+            "actual_sum": 0
+        }
+
+    for game in games:
+        rating_difference = (
+            game["home_elo"]
+            - game["away_elo"]
+            + home_field_elo
+        )
+
+        probability = (
+            elo_probability_with_scale(
+                rating_difference,
+                scale
+            )
+        )
+
+        pct = max(
+            0.0,
+            min(
+                99.999999,
+                probability * 100.0
+            )
+        )
+
+        start_pct = int(
+            pct // 10
+        ) * 10
+
+        key = (
+            f"{start_pct:02d}-"
+            f"{start_pct + 10:02d}%"
+        )
+
+        buckets[key]["count"] += 1
+        buckets[key]["predicted_sum"] += probability
+        buckets[key]["actual_sum"] += (
+            game["home_win"]
+        )
+
+    result = []
+
+    for key, values in buckets.items():
+        count = values["count"]
+
+        if count == 0:
+            continue
+
+        avg_predicted = (
+            values["predicted_sum"]
+            / count
+        )
+
+        actual_rate = (
+            values["actual_sum"]
+            / count
+        )
+
+        result.append({
+            "bucket": key,
+            "count": count,
+            "average_predicted_probability": round(
+                avg_predicted,
+                4
+            ),
+            "actual_home_win_rate": round(
+                actual_rate,
+                4
+            ),
+            "calibration_gap": round(
+                actual_rate - avg_predicted,
+                4
+            )
+        })
+
+    return result
+
+
+@app.get("/out-of-sample-elo-model")
+def out_of_sample_elo_model():
+    try:
+        training_games, training_counts = (
+            calibration_games(
+                2021,
+                2024
+            )
+        )
+
+        test_games, test_counts = (
+            calibration_games(
+                2025,
+                2025
+            )
+        )
+
+        if not training_games:
+            return jsonify(
+                success=False,
+                error=(
+                    "No qualifying 2021-2024 "
+                    "training games were returned."
+                )
+            ), 500
+
+        if not test_games:
+            return jsonify(
+                success=False,
+                error=(
+                    "No qualifying 2025 test "
+                    "games were returned."
+                )
+            ), 500
+
+        (
+            fitted_hfa,
+            fitted_scale,
+            training_loss_fitted
+        ) = fit_elo_curve(
+            training_games
+        )
+
+        baseline_training = (
+            elo_model_metrics(
+                training_games,
+                CALIBRATED_HOME_FIELD_ELO,
+                400.0
+            )
+        )
+
+        fitted_training = (
+            elo_model_metrics(
+                training_games,
+                fitted_hfa,
+                fitted_scale
+            )
+        )
+
+        baseline_test = (
+            elo_model_metrics(
+                test_games,
+                CALIBRATED_HOME_FIELD_ELO,
+                400.0
+            )
+        )
+
+        fitted_test = (
+            elo_model_metrics(
+                test_games,
+                fitted_hfa,
+                fitted_scale
+            )
+        )
+
+        test_log_loss_difference = (
+            fitted_test["log_loss"]
+            - baseline_test["log_loss"]
+        )
+
+        test_brier_difference = (
+            fitted_test["brier_score"]
+            - baseline_test["brier_score"]
+        )
+
+        if (
+            fitted_test["log_loss"]
+            < baseline_test["log_loss"]
+        ):
+            better_log_loss = (
+                "fitted_elo_curve"
+            )
+        elif (
+            baseline_test["log_loss"]
+            < fitted_test["log_loss"]
+        ):
+            better_log_loss = (
+                "current_live_shape"
+            )
+        else:
+            better_log_loss = "tie"
+
+        if (
+            fitted_test["brier_score"]
+            < baseline_test["brier_score"]
+        ):
+            better_brier = (
+                "fitted_elo_curve"
+            )
+        elif (
+            baseline_test["brier_score"]
+            < fitted_test["brier_score"]
+        ):
+            better_brier = (
+                "current_live_shape"
+            )
+        else:
+            better_brier = "tie"
+
+        return jsonify(
+            success=True,
+
+            design={
+                "training_period": {
+                    "start_year": 2021,
+                    "end_year": 2024
+                },
+                "test_period": {
+                    "start_year": 2025,
+                    "end_year": 2025
+                },
+                "test_year_excluded_from_fit": True,
+                "objective": (
+                    "Fit both home-field Elo and "
+                    "the Elo logistic scale on "
+                    "2021-2024 only, then evaluate "
+                    "the fitted probability curve "
+                    "on unseen 2025 games."
+                )
+            },
+
+            filters={
+                "completed_only": True,
+                "regular_season_only": True,
+                "non_neutral_only": True,
+                "fbs_vs_fbs_only": True,
+                "ties_excluded": True,
+                "pregame_elo_required": True
+            },
+
+            current_live_shape={
+                "home_field_elo_points": (
+                    CALIBRATED_HOME_FIELD_ELO
+                ),
+                "elo_scale": 400.0,
+                "formula": (
+                    "1 / (1 + 10^(-rating_difference/400))"
+                )
+            },
+
+            fitted_2021_2024={
+                "home_field_elo_points": (
+                    fitted_hfa
+                ),
+                "elo_scale": (
+                    fitted_scale
+                ),
+                "training_log_loss": round(
+                    training_loss_fitted,
+                    6
+                ),
+                "changed_live_model": False
+            },
+
+            training={
+                **summarize_calibration_games(
+                    training_games
+                ),
+                "games_by_year": training_counts,
+                "current_live_shape": {
+                    "log_loss": round(
+                        baseline_training["log_loss"],
+                        6
+                    ),
+                    "brier_score": round(
+                        baseline_training["brier_score"],
+                        6
+                    )
+                },
+                "fitted_elo_curve": {
+                    "log_loss": round(
+                        fitted_training["log_loss"],
+                        6
+                    ),
+                    "brier_score": round(
+                        fitted_training["brier_score"],
+                        6
+                    )
+                }
+            },
+
+            test_2025={
+                **summarize_calibration_games(
+                    test_games
+                ),
+                "games_by_year": test_counts,
+
+                "current_live_shape": {
+                    "home_field_elo_points": (
+                        CALIBRATED_HOME_FIELD_ELO
+                    ),
+                    "elo_scale": 400.0,
+                    "log_loss": round(
+                        baseline_test["log_loss"],
+                        6
+                    ),
+                    "brier_score": round(
+                        baseline_test["brier_score"],
+                        6
+                    ),
+                    "calibration_buckets": (
+                        elo_calibration_buckets(
+                            test_games,
+                            CALIBRATED_HOME_FIELD_ELO,
+                            400.0
+                        )
+                    )
+                },
+
+                "fitted_elo_curve": {
+                    "home_field_elo_points": (
+                        fitted_hfa
+                    ),
+                    "elo_scale": (
+                        fitted_scale
+                    ),
+                    "log_loss": round(
+                        fitted_test["log_loss"],
+                        6
+                    ),
+                    "brier_score": round(
+                        fitted_test["brier_score"],
+                        6
+                    ),
+                    "calibration_buckets": (
+                        elo_calibration_buckets(
+                            test_games,
+                            fitted_hfa,
+                            fitted_scale
+                        )
+                    )
+                },
+
+                "fitted_minus_current_log_loss": round(
+                    test_log_loss_difference,
+                    6
+                ),
+
+                "fitted_minus_current_brier_score": round(
+                    test_brier_difference,
+                    6
+                ),
+
+                "better_on_log_loss": (
+                    better_log_loss
+                ),
+
+                "better_on_brier_score": (
+                    better_brier
+                )
+            },
+
+            interpretation={
+                "lower_log_loss_is_better": True,
+                "lower_brier_score_is_better": True,
+                "why_this_matters": (
+                    "This tests whether the standard "
+                    "400-point Elo probability curve "
+                    "is too aggressive or too "
+                    "conservative for college football."
+                ),
+                "decision_rule": (
+                    "Do not change the live model "
+                    "unless the fitted curve improves "
+                    "unseen 2025 performance by a "
+                    "meaningful amount and behaves "
+                    "sensibly across probability buckets."
+                )
+            }
+        )
+
+    except RuntimeError as e:
+        return jsonify(
+            success=False,
+            error=str(e)
+        ), 500
+
+    except requests.RequestException as e:
+        return jsonify(
+            success=False,
+            error=str(e)
+        ), 502
+
+
