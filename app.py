@@ -2520,88 +2520,114 @@ def elo_model_metrics(
     }
 
 
-def fit_elo_curve(
-    games
-):
-    best_hfa = None
-    best_scale = None
-    best_loss = None
+def fit_elo_curve(games):
+    """
+    Fast two-parameter Elo curve fit.
 
-    # Stage 1: coarse search.
-    # HFA: 0 to 120 in 5-point steps
-    # Scale: 250 to 550 in 10-point steps
-    for hfa in range(
-        0,
-        121,
-        5
-    ):
-        for scale in range(
-            250,
-            551,
-            10
+    The Elo probability model can be written as ordinary logistic
+    regression:
+
+        p = sigmoid(a + b * elo_difference)
+
+    where:
+        scale = ln(10) / b
+        home_field_elo = a / b
+
+    Newton-Raphson therefore fits HFA and scale directly in a few
+    iterations instead of evaluating millions of grid-search
+    combinations. The function keeps the same return values as the
+    previous fitter: (best_hfa, best_scale, best_log_loss).
+    """
+    if not games:
+        raise RuntimeError("Cannot fit Elo curve without games.")
+
+    # Start from the current live shape: 67 HFA / 400 scale.
+    b = math.log(10.0) / 400.0
+    a = b * CALIBRATED_HOME_FIELD_ELO
+
+    for _ in range(30):
+        grad_a = 0.0
+        grad_b = 0.0
+        h_aa = 0.0
+        h_ab = 0.0
+        h_bb = 0.0
+
+        for game in games:
+            x = game["home_elo"] - game["away_elo"]
+            y = game["home_win"]
+
+            z = a + b * x
+
+            # Numerically stable logistic probability.
+            if z >= 0:
+                exp_neg = math.exp(-z)
+                probability = 1.0 / (1.0 + exp_neg)
+            else:
+                exp_pos = math.exp(z)
+                probability = exp_pos / (1.0 + exp_pos)
+
+            error = probability - y
+            weight = probability * (1.0 - probability)
+
+            grad_a += error
+            grad_b += error * x
+
+            h_aa += weight
+            h_ab += weight * x
+            h_bb += weight * x * x
+
+        determinant = (h_aa * h_bb) - (h_ab * h_ab)
+
+        if abs(determinant) < 1e-12:
+            break
+
+        delta_a = (
+            (h_bb * grad_a)
+            - (h_ab * grad_b)
+        ) / determinant
+
+        delta_b = (
+            (-h_ab * grad_a)
+            + (h_aa * grad_b)
+        ) / determinant
+
+        new_a = a - delta_a
+        new_b = b - delta_b
+
+        # Keep the fitted curve in a sensible positive-scale range.
+        min_b = math.log(10.0) / 700.0
+        max_b = math.log(10.0) / 150.0
+        new_b = max(min_b, min(max_b, new_b))
+
+        # Equivalent HFA range used by the prior validation search.
+        new_hfa = new_a / new_b
+        new_hfa = max(0.0, min(150.0, new_hfa))
+        new_a = new_hfa * new_b
+
+        if (
+            abs(new_a - a) < 1e-10
+            and abs(new_b - b) < 1e-12
         ):
-            metrics = elo_model_metrics(
-                games,
-                float(hfa),
-                float(scale)
-            )
+            a = new_a
+            b = new_b
+            break
 
-            loss = metrics["log_loss"]
+        a = new_a
+        b = new_b
 
-            if (
-                best_loss is None
-                or loss < best_loss
-            ):
-                best_loss = loss
-                best_hfa = float(hfa)
-                best_scale = float(scale)
+    best_scale = math.log(10.0) / b
+    best_hfa = a / b
 
-    # Stage 2: refine around the coarse optimum.
-    hfa_start = max(
-        0,
-        int(best_hfa - 10)
+    metrics = elo_model_metrics(
+        games,
+        best_hfa,
+        best_scale
     )
-    hfa_end = min(
-        150,
-        int(best_hfa + 10)
-    )
-
-    scale_start = max(
-        150,
-        int(best_scale - 20)
-    )
-    scale_end = min(
-        700,
-        int(best_scale + 20)
-    )
-
-    for hfa in range(
-        hfa_start,
-        hfa_end + 1,
-        1
-    ):
-        for scale in range(
-            scale_start,
-            scale_end + 1,
-            2
-        ):
-            metrics = elo_model_metrics(
-                games,
-                float(hfa),
-                float(scale)
-            )
-
-            loss = metrics["log_loss"]
-
-            if loss < best_loss:
-                best_loss = loss
-                best_hfa = float(hfa)
-                best_scale = float(scale)
 
     return (
-        best_hfa,
-        best_scale,
-        best_loss
+        round(best_hfa, 3),
+        round(best_scale, 3),
+        metrics["log_loss"]
     )
 
 
@@ -3017,48 +3043,25 @@ def out_of_sample_elo_model():
 @app.get("/walk-forward-elo-model")
 def walk_forward_elo_model():
     try:
-        # ----------------------------------------------------
-        # FETCH HISTORICAL DATA ONCE
-        # ----------------------------------------------------
-        all_games = []
+        # Fetch each historical season once, then reuse it for every fold.
         games_by_year = {}
 
         for year in range(2021, 2026):
-            year_games, year_counts = calibration_games(
-                year,
-                year
-            )
-
+            year_games, _ = calibration_games(year, year)
             games_by_year[year] = year_games
-            all_games.extend(year_games)
 
-        if not all_games:
-            return jsonify(
-                success=False,
-                error="No qualifying historical games were returned."
-            ), 500
-
-        # ----------------------------------------------------
-        # WALK-FORWARD TESTS
-        # 2024 trained only on 2021-2023
-        # 2025 trained only on 2021-2024
-        # ----------------------------------------------------
         test_years = [2024, 2025]
-
         yearly_results = []
 
         total_test_games = 0
-
         weighted_current_log_loss = 0.0
         weighted_fitted_log_loss = 0.0
-
         weighted_current_brier = 0.0
         weighted_fitted_brier = 0.0
 
         fitted_log_loss_wins = 0
         current_log_loss_wins = 0
         log_loss_ties = 0
-
         fitted_brier_wins = 0
         current_brier_wins = 0
         brier_ties = 0
@@ -3067,49 +3070,23 @@ def walk_forward_elo_model():
         fitted_scales = []
 
         for test_year in test_years:
-
-            training_years = list(
-                range(
-                    2021,
-                    test_year
-                )
-            )
-
             training_games = []
-
             training_counts = {}
 
-            for year in training_years:
-                year_games = games_by_year.get(
-                    year,
-                    []
-                )
+            for year in range(2021, test_year):
+                year_games = games_by_year.get(year, [])
+                training_games.extend(year_games)
+                training_counts[str(year)] = len(year_games)
 
-                training_games.extend(
-                    year_games
-                )
-
-                training_counts[str(year)] = len(
-                    year_games
-                )
-
-            test_games = games_by_year.get(
-                test_year,
-                []
-            )
-
-            test_counts = {
-                str(test_year): len(
-                    test_games
-                )
-            }
+            test_games = games_by_year.get(test_year, [])
+            test_counts = {str(test_year): len(test_games)}
 
             if not training_games:
                 return jsonify(
                     success=False,
                     error=(
-                        f"No qualifying training games "
-                        f"were available before {test_year}."
+                        f"No qualifying training games were available "
+                        f"before {test_year}."
                     )
                 ), 500
 
@@ -3117,30 +3094,21 @@ def walk_forward_elo_model():
                 return jsonify(
                     success=False,
                     error=(
-                        f"No qualifying test games "
-                        f"were available for {test_year}."
+                        f"No qualifying test games were available "
+                        f"for {test_year}."
                     )
                 ), 500
 
-            # ------------------------------------------------
-            # FIT MODEL USING PRIOR YEARS ONLY
-            # ------------------------------------------------
-            (
-                fitted_hfa,
-                fitted_scale,
-                fitted_training_loss
-            ) = fit_elo_curve(
-                training_games
+            fitted_hfa, fitted_scale, fitted_training_loss = (
+                fit_elo_curve(training_games)
             )
 
-            # Current live model = 67 HFA / 400 scale
             current_test = elo_model_metrics(
                 test_games,
                 CALIBRATED_HOME_FIELD_ELO,
                 400.0
             )
 
-            # Walk-forward fitted model
             fitted_test = elo_model_metrics(
                 test_games,
                 fitted_hfa,
@@ -3157,17 +3125,12 @@ def walk_forward_elo_model():
                 - current_test["brier_score"]
             )
 
-            # ------------------------------------------------
-            # DETERMINE WINNER FOR THIS UNSEEN SEASON
-            # ------------------------------------------------
             if log_loss_difference < 0:
                 log_loss_winner = "fitted_elo_curve"
                 fitted_log_loss_wins += 1
-
             elif log_loss_difference > 0:
                 log_loss_winner = "current_live_shape"
                 current_log_loss_wins += 1
-
             else:
                 log_loss_winner = "tie"
                 log_loss_ties += 1
@@ -3175,152 +3138,80 @@ def walk_forward_elo_model():
             if brier_difference < 0:
                 brier_winner = "fitted_elo_curve"
                 fitted_brier_wins += 1
-
             elif brier_difference > 0:
                 brier_winner = "current_live_shape"
                 current_brier_wins += 1
-
             else:
                 brier_winner = "tie"
                 brier_ties += 1
 
-            test_sample_size = len(
-                test_games
-            )
-
-            total_test_games += (
-                test_sample_size
-            )
+            test_sample_size = len(test_games)
+            total_test_games += test_sample_size
 
             weighted_current_log_loss += (
-                current_test["log_loss"]
-                * test_sample_size
+                current_test["log_loss"] * test_sample_size
             )
-
             weighted_fitted_log_loss += (
-                fitted_test["log_loss"]
-                * test_sample_size
+                fitted_test["log_loss"] * test_sample_size
             )
-
             weighted_current_brier += (
-                current_test["brier_score"]
-                * test_sample_size
+                current_test["brier_score"] * test_sample_size
             )
-
             weighted_fitted_brier += (
-                fitted_test["brier_score"]
-                * test_sample_size
+                fitted_test["brier_score"] * test_sample_size
             )
 
-            fitted_hfas.append(
-                fitted_hfa
-            )
-
-            fitted_scales.append(
-                fitted_scale
-            )
+            fitted_hfas.append(fitted_hfa)
+            fitted_scales.append(fitted_scale)
 
             yearly_results.append({
-
-                "test_year":
-                    test_year,
-
+                "test_year": test_year,
                 "training_period": {
                     "start_year": 2021,
                     "end_year": test_year - 1
                 },
-
-                "training_sample_size":
-                    len(training_games),
-
-                "training_games_by_year":
-                    training_counts,
-
-                "test_sample_size":
-                    test_sample_size,
-
-                "test_games_by_year":
-                    test_counts,
-
+                "training_sample_size": len(training_games),
+                "training_games_by_year": training_counts,
+                "test_sample_size": test_sample_size,
+                "test_games_by_year": test_counts,
                 "fitted_on_prior_seasons_only": {
-
-                    "home_field_elo_points":
-                        fitted_hfa,
-
-                    "elo_scale":
-                        fitted_scale,
-
-                    "training_log_loss":
-                        round(
-                            fitted_training_loss,
-                            6
-                        )
+                    "home_field_elo_points": fitted_hfa,
+                    "elo_scale": fitted_scale,
+                    "training_log_loss": round(
+                        fitted_training_loss, 6
+                    )
                 },
-
                 "current_live_shape": {
-
                     "home_field_elo_points":
                         CALIBRATED_HOME_FIELD_ELO,
-
-                    "elo_scale":
-                        400.0,
-
-                    "test_log_loss":
-                        round(
-                            current_test["log_loss"],
-                            6
-                        ),
-
-                    "test_brier_score":
-                        round(
-                            current_test["brier_score"],
-                            6
-                        )
+                    "elo_scale": 400.0,
+                    "test_log_loss": round(
+                        current_test["log_loss"], 6
+                    ),
+                    "test_brier_score": round(
+                        current_test["brier_score"], 6
+                    )
                 },
-
                 "fitted_elo_curve": {
-
-                    "home_field_elo_points":
-                        fitted_hfa,
-
-                    "elo_scale":
-                        fitted_scale,
-
-                    "test_log_loss":
-                        round(
-                            fitted_test["log_loss"],
-                            6
-                        ),
-
-                    "test_brier_score":
-                        round(
-                            fitted_test["brier_score"],
-                            6
-                        )
+                    "home_field_elo_points": fitted_hfa,
+                    "elo_scale": fitted_scale,
+                    "test_log_loss": round(
+                        fitted_test["log_loss"], 6
+                    ),
+                    "test_brier_score": round(
+                        fitted_test["brier_score"], 6
+                    )
                 },
-
-                "fitted_minus_current_log_loss":
-                    round(
-                        log_loss_difference,
-                        6
-                    ),
-
-                "fitted_minus_current_brier_score":
-                    round(
-                        brier_difference,
-                        6
-                    ),
-
-                "better_on_log_loss":
-                    log_loss_winner,
-
-                "better_on_brier_score":
-                    brier_winner
+                "fitted_minus_current_log_loss": round(
+                    log_loss_difference, 6
+                ),
+                "fitted_minus_current_brier_score": round(
+                    brier_difference, 6
+                ),
+                "better_on_log_loss": log_loss_winner,
+                "better_on_brier_score": brier_winner
             })
 
-        # ----------------------------------------------------
-        # AGGREGATE RESULTS
-        # ----------------------------------------------------
         if total_test_games == 0:
             return jsonify(
                 success=False,
@@ -3328,73 +3219,35 @@ def walk_forward_elo_model():
             ), 500
 
         current_log_loss = (
-            weighted_current_log_loss
-            / total_test_games
+            weighted_current_log_loss / total_test_games
         )
-
         fitted_log_loss = (
-            weighted_fitted_log_loss
-            / total_test_games
+            weighted_fitted_log_loss / total_test_games
         )
-
         current_brier = (
-            weighted_current_brier
-            / total_test_games
+            weighted_current_brier / total_test_games
         )
-
         fitted_brier = (
-            weighted_fitted_brier
-            / total_test_games
-        )
-
-        log_loss_difference = (
-            fitted_log_loss
-            - current_log_loss
-        )
-
-        brier_difference = (
-            fitted_brier
-            - current_brier
-        )
-
-        average_hfa = (
-            sum(fitted_hfas)
-            / len(fitted_hfas)
-        )
-
-        average_scale = (
-            sum(fitted_scales)
-            / len(fitted_scales)
+            weighted_fitted_brier / total_test_games
         )
 
         return jsonify(
-
             success=True,
-
             design={
-                "method":
-                    "expanding-window walk-forward validation",
-
-                "test_years":
-                    test_years,
-
-                "training_rule":
-                    (
-                        "Each test season is predicted "
-                        "using a model fitted only on "
-                        "earlier seasons."
-                    ),
-
-                "future_data_used_in_fit":
-                    False,
-
-                "historical_data_fetched_once":
-                    True,
-
-                "live_model_changed":
-                    False
+                "method": "expanding-window walk-forward validation",
+                "fit_method": (
+                    "two-parameter logistic Newton-Raphson fit "
+                    "equivalent to the Elo probability curve"
+                ),
+                "test_years": test_years,
+                "training_rule": (
+                    "Each test season is predicted using a model "
+                    "fitted only on earlier seasons."
+                ),
+                "future_data_used_in_fit": False,
+                "historical_data_fetched_once": True,
+                "live_model_changed": False
             },
-
             filters={
                 "completed_only": True,
                 "regular_season_only": True,
@@ -3403,127 +3256,60 @@ def walk_forward_elo_model():
                 "ties_excluded": True,
                 "pregame_elo_required": True
             },
-
             current_live_shape={
                 "home_field_elo_points":
                     CALIBRATED_HOME_FIELD_ELO,
-
-                "elo_scale":
-                    400.0
+                "elo_scale": 400.0
             },
-
-            yearly_results=
-                yearly_results,
-
+            yearly_results=yearly_results,
             aggregate={
-
-                "total_unseen_test_games":
-                    total_test_games,
-
+                "total_unseen_test_games": total_test_games,
                 "current_live_shape": {
-
-                    "log_loss":
-                        round(
-                            current_log_loss,
-                            6
-                        ),
-
-                    "brier_score":
-                        round(
-                            current_brier,
-                            6
-                        )
+                    "log_loss": round(current_log_loss, 6),
+                    "brier_score": round(current_brier, 6)
                 },
-
                 "walk_forward_fitted_curve": {
-
-                    "log_loss":
-                        round(
-                            fitted_log_loss,
-                            6
-                        ),
-
-                    "brier_score":
-                        round(
-                            fitted_brier,
-                            6
-                        )
+                    "log_loss": round(fitted_log_loss, 6),
+                    "brier_score": round(fitted_brier, 6)
                 },
-
-                "fitted_minus_current_log_loss":
-                    round(
-                        log_loss_difference,
-                        6
-                    ),
-
-                "fitted_minus_current_brier_score":
-                    round(
-                        brier_difference,
-                        6
-                    ),
-
+                "fitted_minus_current_log_loss": round(
+                    fitted_log_loss - current_log_loss, 6
+                ),
+                "fitted_minus_current_brier_score": round(
+                    fitted_brier - current_brier, 6
+                ),
                 "season_wins": {
-
                     "log_loss": {
-
-                        "fitted_elo_curve":
-                            fitted_log_loss_wins,
-
-                        "current_live_shape":
-                            current_log_loss_wins,
-
-                        "ties":
-                            log_loss_ties
+                        "fitted_elo_curve": fitted_log_loss_wins,
+                        "current_live_shape": current_log_loss_wins,
+                        "ties": log_loss_ties
                     },
-
                     "brier_score": {
-
-                        "fitted_elo_curve":
-                            fitted_brier_wins,
-
-                        "current_live_shape":
-                            current_brier_wins,
-
-                        "ties":
-                            brier_ties
+                        "fitted_elo_curve": fitted_brier_wins,
+                        "current_live_shape": current_brier_wins,
+                        "ties": brier_ties
                     }
                 },
-
                 "average_fitted_parameters": {
-
-                    "home_field_elo_points":
-                        round(
-                            average_hfa,
-                            2
-                        ),
-
-                    "elo_scale":
-                        round(
-                            average_scale,
-                            2
-                        )
+                    "home_field_elo_points": round(
+                        sum(fitted_hfas) / len(fitted_hfas), 2
+                    ),
+                    "elo_scale": round(
+                        sum(fitted_scales) / len(fitted_scales), 2
+                    )
                 }
             },
-
             interpretation={
-
-                "lower_log_loss_is_better":
-                    True,
-
-                "lower_brier_score_is_better":
-                    True,
-
+                "lower_log_loss_is_better": True,
+                "lower_brier_score_is_better": True,
                 "negative_difference_means_fitted_model_improved":
                     True,
-
-                "decision_rule":
-                    (
-                        "Do not change the live model "
-                        "automatically. Evaluate whether "
-                        "the fitted curve improves both "
-                        "unseen seasons and whether its "
-                        "parameters remain reasonably stable."
-                    )
+                "decision_rule": (
+                    "Do not change the live model automatically. "
+                    "Evaluate whether the fitted curve improves both "
+                    "unseen seasons and whether its parameters remain "
+                    "reasonably stable."
+                )
             }
         )
 
@@ -3538,3 +3324,4 @@ def walk_forward_elo_model():
             success=False,
             error=str(e)
         ), 502
+
