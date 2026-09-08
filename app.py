@@ -64,6 +64,15 @@ MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS = float(
     )
 )
 
+# ============================================================
+# BUY / PASS DECISION CONFIGURATION
+# ============================================================
+
+MIN_DECISION_NET_EDGE = 0.03
+MIN_DECISION_NET_ROI = 0.05
+MIN_LIQUIDITY_COVERAGE = 1.50
+DECISION_POSITION_TIERS = (80.0, 60.0, 40.0, 20.0)
+
 
 @app.get("/")
 def home():
@@ -81,7 +90,14 @@ def home():
             "max_slippage_dollars":
                 MAX_ALLOWED_SLIPPAGE_DOLLARS,
             "max_bid_ask_spread_dollars":
-                MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+                MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS,
+            "decision_engine": {
+                "enabled": True,
+                "min_net_edge": MIN_DECISION_NET_EDGE,
+                "min_net_roi": MIN_DECISION_NET_ROI,
+                "min_liquidity_coverage": MIN_LIQUIDITY_COVERAGE,
+                "position_tiers_dollars": list(DECISION_POSITION_TIERS)
+            }
         }
     )
 
@@ -1180,6 +1196,388 @@ def execution_side_metrics(
     }
 
 
+def decision_tier_for_edge(net_edge):
+    """Return the largest approved dollar tier justified by net edge."""
+    edge = number(net_edge)
+
+    if edge is None or edge < MIN_DECISION_NET_EDGE:
+        return 0.0
+    if edge >= 0.07:
+        return 80.0
+    if edge >= 0.05:
+        return 60.0
+    if edge >= 0.04:
+        return 40.0
+    return 20.0
+
+
+def contracts_within_slippage_limit(ask_levels):
+    """
+    Count contracts available from best ask through the maximum
+    allowed slippage price. This is the depth used for the 150%
+    liquidity-coverage rule.
+    """
+    normalized = []
+
+    for level in ask_levels or []:
+        price = number(level.get("price"))
+        quantity = number(level.get("quantity"))
+
+        if (
+            price is None
+            or quantity is None
+            or price <= 0
+            or quantity <= 0
+        ):
+            continue
+
+        normalized.append({
+            "price": float(price),
+            "quantity": float(quantity)
+        })
+
+    if not normalized:
+        return {
+            "best_ask": None,
+            "maximum_acceptable_price": None,
+            "contracts_available": 0.0
+        }
+
+    normalized.sort(key=lambda level: level["price"])
+    best_ask = normalized[0]["price"]
+    maximum_acceptable_price = (
+        best_ask + MAX_ALLOWED_SLIPPAGE_DOLLARS
+    )
+
+    available = sum(
+        level["quantity"]
+        for level in normalized
+        if level["price"] <= maximum_acceptable_price + 1e-12
+    )
+
+    return {
+        "best_ask": round(best_ask, 6),
+        "maximum_acceptable_price":
+            round(maximum_acceptable_price, 6),
+        "contracts_available": round(available, 4)
+    }
+
+
+def evaluate_trade_side_decision(
+    side,
+    fair_probability,
+    bid_levels,
+    ask_levels,
+    requested_max_position_dollars
+):
+    """
+    Test $80 -> $60 -> $40 -> $20, re-walking the book and
+    recalculating documented fees at every tier. Return the largest
+    tier that passes every agreed BUY rule.
+    """
+    fair_probability = clamp_probability(fair_probability)
+    requested_cap = number(requested_max_position_dollars)
+
+    if requested_cap is None or requested_cap <= 0:
+        requested_cap = EXECUTION_DEFAULT_MAX_POSITION_DOLLARS
+
+    effective_cap = min(80.0, requested_cap)
+    tiers = [
+        tier for tier in DECISION_POSITION_TIERS
+        if tier <= effective_cap + 1e-9
+    ]
+
+    if fair_probability is None:
+        return {
+            "action": "PASS",
+            "side": side,
+            "reason": "No independent fair probability is available.",
+            "attempts": []
+        }
+
+    if not tiers:
+        return {
+            "action": "PASS",
+            "side": side,
+            "reason": "Requested dollar cap is below the $20 minimum decision tier.",
+            "attempts": []
+        }
+
+    depth = contracts_within_slippage_limit(ask_levels)
+    attempts = []
+
+    for tier in tiers:
+        metrics = execution_side_metrics(
+            side,
+            fair_probability,
+            bid_levels,
+            ask_levels,
+            max_position_dollars=tier
+        )
+
+        if not metrics.get("available"):
+            attempts.append({
+                "tier_dollars": tier,
+                "passed": False,
+                "fail_reasons": [
+                    metrics.get("sizing", {}).get(
+                        "reason",
+                        "Execution unavailable at this tier."
+                    )
+                ],
+                "execution": metrics
+            })
+            continue
+
+        contracts = number(metrics.get("final_contract_count")) or 0.0
+        net_edge = number(metrics.get("net_execution_edge"))
+        net_roi = number(metrics.get("net_expected_roi"))
+        spread = number(metrics.get("bid_ask_spread"))
+        slippage = number(metrics.get("slippage_dollars"))
+        all_in_cost = number(metrics.get("all_in_total_cost_dollars"))
+        full_fill = bool(
+            metrics.get("orderbook_walk", {}).get("full_fill")
+        )
+
+        liquidity_coverage = (
+            depth["contracts_available"] / contracts
+            if contracts > 0
+            else 0.0
+        )
+
+        justified_tier = decision_tier_for_edge(net_edge)
+
+        checks = {
+            "net_edge_pass": (
+                net_edge is not None
+                and net_edge >= MIN_DECISION_NET_EDGE
+            ),
+            "net_roi_pass": (
+                net_roi is not None
+                and net_roi >= MIN_DECISION_NET_ROI
+            ),
+            "spread_pass": (
+                spread is not None
+                and spread <= MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+            ),
+            "slippage_pass": (
+                slippage is not None
+                and slippage <= MAX_ALLOWED_SLIPPAGE_DOLLARS
+            ),
+            "full_fill_pass": full_fill,
+            "liquidity_coverage_pass": (
+                liquidity_coverage >= MIN_LIQUIDITY_COVERAGE
+            ),
+            "affordability_pass": (
+                all_in_cost is not None
+                and all_in_cost <= tier + 1e-9
+            ),
+            "edge_tier_pass": tier <= justified_tier + 1e-9
+        }
+
+        fail_reasons = []
+        if not checks["net_edge_pass"]:
+            fail_reasons.append("Net edge is below 3.00 percentage points.")
+        if not checks["net_roi_pass"]:
+            fail_reasons.append("Net ROI is below 5.00%.")
+        if not checks["spread_pass"]:
+            fail_reasons.append("Bid/ask spread exceeds 5 cents.")
+        if not checks["slippage_pass"]:
+            fail_reasons.append("Slippage exceeds 2 cents.")
+        if not checks["full_fill_pass"]:
+            fail_reasons.append("The proposed position cannot be fully filled.")
+        if not checks["liquidity_coverage_pass"]:
+            fail_reasons.append("Liquidity coverage is below 150% within the 2-cent slippage limit.")
+        if not checks["affordability_pass"]:
+            fail_reasons.append("Fee-inclusive position cost exceeds the tier cap.")
+        if not checks["edge_tier_pass"]:
+            fail_reasons.append(
+                f"Final net edge only justifies up to ${int(justified_tier)}."
+                if justified_tier > 0
+                else "Final net edge does not justify any position tier."
+            )
+
+        passed = all(checks.values())
+
+        attempt = {
+            "tier_dollars": tier,
+            "passed": passed,
+            "checks": checks,
+            "fail_reasons": fail_reasons,
+            "final_contracts": int(contracts) if contracts > 0 else 0,
+            "all_in_total_cost_dollars": all_in_cost,
+            "net_edge": net_edge,
+            "net_edge_percentage_points": (
+                round(net_edge * 100, 2)
+                if net_edge is not None
+                else None
+            ),
+            "net_roi": net_roi,
+            "net_roi_percent": (
+                round(net_roi * 100, 2)
+                if net_roi is not None
+                else None
+            ),
+            "spread_dollars": spread,
+            "slippage_dollars": slippage,
+            "liquidity": {
+                **depth,
+                "coverage_ratio": round(liquidity_coverage, 4),
+                "coverage_percent": round(liquidity_coverage * 100, 2),
+                "minimum_required_ratio": MIN_LIQUIDITY_COVERAGE
+            },
+            "justified_tier_dollars": justified_tier,
+            "execution": metrics
+        }
+        attempts.append(attempt)
+
+        if passed:
+            return {
+                "action": f"BUY {side}",
+                "side": side,
+                "approved_tier_dollars": tier,
+                "contracts": int(contracts),
+                "all_in_total_cost_dollars": all_in_cost,
+                "net_edge": net_edge,
+                "net_edge_percentage_points":
+                    round(net_edge * 100, 2),
+                "net_roi": net_roi,
+                "net_roi_percent": round(net_roi * 100, 2),
+                "spread_dollars": spread,
+                "slippage_dollars": slippage,
+                "liquidity_coverage_ratio":
+                    round(liquidity_coverage, 4),
+                "liquidity_coverage_percent":
+                    round(liquidity_coverage * 100, 2),
+                "fee_dollars": metrics.get("total_fee_dollars"),
+                "weighted_average_fill_price":
+                    metrics.get("weighted_average_fill_price"),
+                "attempts": attempts
+            }
+
+    # Report the strongest failed attempt for easier diagnosis.
+    scored_attempts = [
+        attempt for attempt in attempts
+        if attempt.get("net_edge") is not None
+    ]
+    best_attempt = (
+        max(
+            scored_attempts,
+            key=lambda attempt: (
+                attempt.get("net_edge") or -999,
+                attempt.get("net_roi") or -999
+            )
+        )
+        if scored_attempts
+        else (attempts[-1] if attempts else None)
+    )
+
+    return {
+        "action": "PASS",
+        "side": side,
+        "reason": "No $80/$60/$40/$20 tier passed every decision rule.",
+        "best_failed_attempt": best_attempt,
+        "attempts": attempts
+    }
+
+
+def choose_market_trade_decision(yes_decision, no_decision):
+    """Choose at most one side of one market."""
+    qualifiers = [
+        decision
+        for decision in (yes_decision, no_decision)
+        if str(decision.get("action", "")).startswith("BUY ")
+    ]
+
+    if not qualifiers:
+        return {
+            "action": "PASS",
+            "reason": "Neither YES nor NO passed every decision rule."
+        }
+
+    winner = max(
+        qualifiers,
+        key=lambda decision: (
+            number(decision.get("net_edge")) or -999,
+            number(decision.get("net_roi")) or -999,
+            -(number(decision.get("slippage_dollars")) or 999),
+            number(decision.get("liquidity_coverage_ratio")) or -999
+        )
+    )
+
+    return {
+        key: value
+        for key, value in winner.items()
+        if key != "attempts"
+    }
+
+
+def choose_matchup_trade_decision(winner_candidates):
+    """
+    Select at most one winner-market recommendation across all
+    equivalent contract representations in the matchup.
+    """
+    qualifiers = []
+    passes = []
+
+    for market in winner_candidates or []:
+        execution = market.get("execution_analysis") or {}
+        engine = execution.get("decision_engine") or {}
+        decision = engine.get("market_decision") or {}
+
+        record = {
+            "ticker": market.get("ticker"),
+            "title": market.get("title"),
+            **decision
+        }
+
+        if str(decision.get("action", "")).startswith("BUY "):
+            qualifiers.append(record)
+        else:
+            passes.append(record)
+
+    thresholds = {
+        "minimum_net_edge": MIN_DECISION_NET_EDGE,
+        "minimum_net_edge_percentage_points": MIN_DECISION_NET_EDGE * 100,
+        "minimum_net_roi": MIN_DECISION_NET_ROI,
+        "minimum_net_roi_percent": MIN_DECISION_NET_ROI * 100,
+        "maximum_spread_dollars": MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS,
+        "maximum_slippage_dollars": MAX_ALLOWED_SLIPPAGE_DOLLARS,
+        "minimum_liquidity_coverage_ratio": MIN_LIQUIDITY_COVERAGE,
+        "position_tiers_dollars": list(DECISION_POSITION_TIERS),
+        "full_fill_required": True,
+        "documented_fee_simulation_required": True
+    }
+
+    if not qualifiers:
+        return {
+            "action": "PASS",
+            "reason": "No winner-market representation passed every BUY rule at any approved tier.",
+            "thresholds": thresholds,
+            "market_results": passes
+        }
+
+    winner = max(
+        qualifiers,
+        key=lambda decision: (
+            number(decision.get("net_edge")) or -999,
+            number(decision.get("net_roi")) or -999,
+            -(number(decision.get("slippage_dollars")) or 999),
+            number(decision.get("liquidity_coverage_ratio")) or -999
+        )
+    )
+
+    return {
+        **winner,
+        "thresholds": thresholds,
+        "selection_rule": (
+            "If multiple economically equivalent contract representations qualify, "
+            "choose higher net edge, then higher net ROI, then lower slippage, "
+            "then greater liquidity coverage. Only one winner exposure is returned."
+        )
+    }
+
+
 def build_execution_analysis(
     ticker,
     fair_yes_probability,
@@ -1220,6 +1618,21 @@ def build_execution_analysis(
             if desired_contracts is None:
                 desired_contracts = EXECUTION_DEFAULT_CONTRACTS
 
+        yes_decision = evaluate_trade_side_decision(
+            "YES",
+            fair_yes,
+            book["yes_bids"],
+            book["yes_asks"],
+            max_position_dollars
+        )
+        no_decision = evaluate_trade_side_decision(
+            "NO",
+            fair_no,
+            book["no_bids"],
+            book["no_asks"],
+            max_position_dollars
+        )
+
         return {
             "available": True,
             "ticker": ticker,
@@ -1251,7 +1664,22 @@ def build_execution_analysis(
                 "max_allowed_slippage_dollars":
                     MAX_ALLOWED_SLIPPAGE_DOLLARS,
                 "max_allowed_bid_ask_spread_dollars":
-                    MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+                    MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS,
+                "minimum_liquidity_coverage_ratio":
+                    MIN_LIQUIDITY_COVERAGE
+            },
+            "decision_engine": {
+                "enabled": True,
+                "position_tiers_dollars": list(DECISION_POSITION_TIERS),
+                "minimum_net_edge": MIN_DECISION_NET_EDGE,
+                "minimum_net_roi": MIN_DECISION_NET_ROI,
+                "minimum_liquidity_coverage_ratio": MIN_LIQUIDITY_COVERAGE,
+                "yes": yes_decision,
+                "no": no_decision,
+                "market_decision": choose_market_trade_decision(
+                    yes_decision,
+                    no_decision
+                )
             },
             "yes": execution_side_metrics(
                 "YES",
@@ -3372,6 +3800,10 @@ def analyze():
                 "max_allowed_bid_ask_spread_dollars":
                     MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
             },
+
+            trade_decision=choose_matchup_trade_decision(
+                winner_candidates
+            ),
 
             summary={
                 "winner_contracts":
