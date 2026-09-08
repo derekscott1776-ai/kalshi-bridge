@@ -589,74 +589,116 @@ def estimated_kalshi_taker_fee(
     fee_rate=None
 ):
     """
-    Estimate taker fees for the exact simulated fills.
+    Simulate Kalshi's documented taker-fee treatment across
+    the order-book fills supplied by the execution engine.
 
-    The configurable general formula is:
-        fee = round up(rate * contracts * price * (1 - price))
-
-    A market order can execute at multiple price levels. The
-    fee is therefore calculated for each simulated fill level,
-    rounded upward to the next cent at that level, and summed.
-
-    This is exact relative to the configured fee formula used
-    by this bridge. KALSHI_TAKER_FEE_RATE remains configurable
-    because certain Kalshi products can use special schedules.
+    Public order-book depth is aggregated by price level, so
+    each simulated price level is treated as one fill. Actual
+    exchange match segmentation may differ.
     """
     if fee_rate is None:
         fee_rate = KALSHI_TAKER_FEE_RATE
 
-    fee_rate = number(fee_rate)
+    fee_rate_n = number(fee_rate)
 
-    if fee_rate is None or fee_rate < 0:
+    if fee_rate_n is None or fee_rate_n < 0:
         return {
             "fee_rate": None,
             "estimated_fee_dollars": None,
+            "documented_net_fee_dollars": None,
             "fee_details": []
         }
 
-    total_fee = 0.0
+    rate = Decimal(str(fee_rate_n))
+    accumulator = Decimal("0")
+
+    total_raw_fee = Decimal("0")
+    total_trade_fee = Decimal("0")
+    total_rounding_fee = Decimal("0")
+    total_rebate = Decimal("0")
+    total_net_fee = Decimal("0")
+
     fee_details = []
 
-    for fill in fills or []:
-        quantity = number(fill.get("filled_contracts"))
-        price = number(fill.get("price"))
+    for index, fill in enumerate(fills or [], start=1):
+        quantity_n = number(fill.get("filled_contracts"))
+        price_n = number(fill.get("price"))
 
         if (
-            quantity is None
-            or price is None
-            or quantity <= 0
-            or price <= 0
-            or price >= 1
+            quantity_n is None
+            or price_n is None
+            or quantity_n <= 0
+            or not (0 < price_n < 1)
         ):
             continue
 
+        quantity = Decimal(str(quantity_n))
+        price = Decimal(str(price_n))
+        gross_cost = quantity * price
+
         raw_fee = (
-            fee_rate
+            rate
             * quantity
             * price
-            * (1.0 - price)
+            * (Decimal("1") - price)
         )
 
-        rounded_fee = ceil_to_cent(raw_fee)
-        total_fee += rounded_fee
+        trade_fee = raw_fee.quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_CEILING
+        )
+
+        debit_before_rounding = gross_cost + trade_fee
+        cent_aligned_debit = debit_before_rounding.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING
+        )
+        rounding_fee = cent_aligned_debit - debit_before_rounding
+
+        accumulator += rounding_fee
+        rebate = Decimal("0")
+
+        while accumulator >= Decimal("0.01"):
+            rebate += Decimal("0.01")
+            accumulator -= Decimal("0.01")
+
+        net_fee = trade_fee + rounding_fee - rebate
+
+        total_raw_fee += raw_fee
+        total_trade_fee += trade_fee
+        total_rounding_fee += rounding_fee
+        total_rebate += rebate
+        total_net_fee += net_fee
 
         fee_details.append({
-            "price": round(price, 4),
-            "contracts": round(quantity, 4),
-            "raw_formula_fee_dollars": round(raw_fee, 6),
-            "estimated_rounded_fee_dollars": round(rounded_fee, 2)
+            "fill_level": index,
+            "price": round(float(price), 4),
+            "contracts": round(float(quantity), 4),
+            "raw_formula_fee_dollars": round(float(raw_fee), 6),
+            "trade_fee_centicent_ceiled_dollars": round(float(trade_fee), 6),
+            "rounding_fee_dollars": round(float(rounding_fee), 6),
+            "rebate_dollars": round(float(rebate), 6),
+            "accumulator_after_rebate_dollars": round(float(accumulator), 6),
+            "documented_net_fee_dollars": round(float(net_fee), 6)
         })
 
     return {
-        "fee_rate": fee_rate,
+        "fee_rate": fee_rate_n,
+        "fee_method": "kalshi_documented_simulation",
         "fee_rounding": (
-            "Configured formula applied to each simulated "
-            "fill level and rounded up to the next cent."
+            "Trade fee rounded upward to $0.0001; "
+            "balance-alignment rounding accumulated across simulated "
+            "fills with $0.01 rebates."
         ),
-        "estimated_fee_dollars": round(total_fee, 2),
+        "raw_formula_fee_dollars": round(float(total_raw_fee), 6),
+        "trade_fee_dollars": round(float(total_trade_fee), 6),
+        "rounding_fee_dollars": round(float(total_rounding_fee), 6),
+        "rebate_dollars": round(float(total_rebate), 6),
+        "ending_rounding_accumulator_dollars": round(float(accumulator), 6),
+        "estimated_fee_dollars": round(float(total_net_fee), 6),
+        "documented_net_fee_dollars": round(float(total_net_fee), 6),
         "fee_details": fee_details
     }
-
 
 def all_in_execution_cost(
     ask_levels,
@@ -699,7 +741,7 @@ def all_in_execution_cost(
         "walk": walk,
         "fee": fee,
         "gross_cost_dollars": round(gross_cost, 4),
-        "fee_dollars": round(fee_total, 2),
+        "fee_dollars": round(fee_total, 6),
         "all_in_cost_dollars": round(all_in_total, 4),
         "affordable": True,
         "full_fill": bool(walk.get("full_fill"))
