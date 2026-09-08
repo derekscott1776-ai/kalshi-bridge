@@ -2469,6 +2469,237 @@ def orderbook(ticker):
         ), 502
 
 
+
+
+def ceil_decimal(value, quantum):
+    """Round a non-negative Decimal upward to the requested quantum."""
+    value = Decimal(str(value))
+    quantum = Decimal(str(quantum))
+    if value <= 0:
+        return Decimal("0")
+    return value.quantize(quantum, rounding=ROUND_CEILING)
+
+
+def documented_kalshi_fee_comparison(fills, fee_rate=None):
+    """
+    Compare the bridge's legacy per-price-level penny-ceiling fee estimate
+    with Kalshi's documented fee-rounding treatment.
+
+    Kalshi documentation says each actual fill has:
+      1) trade fee = fee model, rounded UP to $0.0001;
+      2) rounding fee = adjustment needed to restore the cash balance to
+         whole-cent alignment after that fill;
+      3) an order-level rounding accumulator that returns $0.01 rebates
+         whenever accumulated rounding overpayment reaches a cent.
+
+    IMPORTANT: the public order-book walk aggregates executable quantity by
+    price level; it does not reveal how that future order will be split into
+    individual exchange matches. Therefore this audit treats each simulated
+    price level as one comparison fill. It is a documented-mechanics
+    comparison, not a claim that the future exchange fee is exact to the cent.
+    """
+    if fee_rate is None:
+        fee_rate = KALSHI_TAKER_FEE_RATE
+
+    fee_rate = number(fee_rate)
+    if fee_rate is None or fee_rate < 0:
+        return {
+            "available": False,
+            "error": "Invalid fee rate."
+        }
+
+    accumulator = Decimal("0")
+    legacy_total = Decimal("0")
+    documented_trade_total = Decimal("0")
+    documented_rounding_total = Decimal("0")
+    documented_rebate_total = Decimal("0")
+    documented_net_total = Decimal("0")
+    rows = []
+
+    for index, fill in enumerate(fills or [], start=1):
+        quantity_n = number(fill.get("filled_contracts"))
+        price_n = number(fill.get("price"))
+        if quantity_n is None or price_n is None or quantity_n <= 0 or not (0 < price_n < 1):
+            continue
+
+        q = Decimal(str(quantity_n))
+        price = Decimal(str(price_n))
+        rate = Decimal(str(fee_rate))
+        gross = q * price
+        raw_fee = rate * q * price * (Decimal("1") - price)
+
+        # Existing bridge treatment: ceil each simulated price level's raw
+        # fee directly to a whole cent.
+        legacy_fee = ceil_decimal(raw_fee, "0.01")
+
+        # Kalshi documented treatment: trade fee to centicent, then restore
+        # balance to cent alignment, with order-level accumulator/rebates.
+        trade_fee = ceil_decimal(raw_fee, "0.0001")
+        debit_before_balance_rounding = gross + trade_fee
+        cent_aligned_debit = ceil_decimal(debit_before_balance_rounding, "0.01")
+        rounding_fee = cent_aligned_debit - debit_before_balance_rounding
+
+        accumulator_before = accumulator
+        accumulator += rounding_fee
+        rebate_cents = int(accumulator / Decimal("0.01"))
+        rebate = Decimal(rebate_cents) * Decimal("0.01")
+        if rebate > 0:
+            accumulator -= rebate
+
+        net_fee = trade_fee + rounding_fee - rebate
+        difference = legacy_fee - net_fee
+
+        legacy_total += legacy_fee
+        documented_trade_total += trade_fee
+        documented_rounding_total += rounding_fee
+        documented_rebate_total += rebate
+        documented_net_total += net_fee
+
+        rows.append({
+            "fill_level": index,
+            "price": round(float(price), 4),
+            "contracts": round(float(q), 4),
+            "gross_contract_cost_dollars": round(float(gross), 6),
+            "raw_formula_fee_dollars": round(float(raw_fee), 6),
+            "app_current_fee_dollars": round(float(legacy_fee), 6),
+            "kalshi_documented": {
+                "trade_fee_centicent_ceiled_dollars": round(float(trade_fee), 6),
+                "rounding_fee_dollars": round(float(rounding_fee), 6),
+                "accumulator_before_rebate_dollars": round(float(accumulator_before + rounding_fee), 6),
+                "rebate_dollars": round(float(rebate), 6),
+                "accumulator_after_rebate_dollars": round(float(accumulator), 6),
+                "net_fee_dollars": round(float(net_fee), 6)
+            },
+            "app_minus_documented_fee_dollars": round(float(difference), 6)
+        })
+
+    difference_total = legacy_total - documented_net_total
+    return {
+        "available": bool(rows),
+        "comparison_basis": (
+            "Each simulated order-book price level is treated as one fill for "
+            "the audit because public book depth does not reveal the future "
+            "match-by-match segmentation of an order."
+        ),
+        "fee_rate": fee_rate,
+        "fill_levels": rows,
+        "totals": {
+            "app_current_fee_dollars": round(float(legacy_total), 6),
+            "kalshi_documented_trade_fee_dollars": round(float(documented_trade_total), 6),
+            "kalshi_documented_rounding_fee_dollars": round(float(documented_rounding_total), 6),
+            "kalshi_documented_rebate_dollars": round(float(documented_rebate_total), 6),
+            "kalshi_documented_net_fee_dollars": round(float(documented_net_total), 6),
+            "app_minus_documented_fee_dollars": round(float(difference_total), 6)
+        },
+        "interpretation": {
+            "positive_difference": "The app's current fee estimate is higher than the documented-mechanics estimate.",
+            "negative_difference": "The app's current fee estimate is lower than the documented-mechanics estimate.",
+            "zero_difference": "The two estimates match for this simulated fill structure."
+        }
+    }
+
+
+@app.get("/fee-audit/<ticker>")
+def fee_audit(ticker):
+    """
+    Audit the bridge's current multi-level fee estimate against Kalshi's
+    documented fee-rounding mechanics for a simulated market buy.
+
+    Query parameters:
+      side=YES|NO                    default YES
+      contracts=<positive number>   optional
+      max_position_dollars=<amount> optional; default $80 when contracts omitted
+      depth=<0..100>                 default 0 (full public depth)
+
+    This endpoint is read-only. It does not place an order.
+    """
+    try:
+        side = request.args.get("side", "YES").strip().upper()
+        if side not in {"YES", "NO"}:
+            return jsonify(success=False, error="side must be YES or NO."), 400
+
+        depth = request.args.get("depth", "0", type=int)
+        if depth is None or depth < 0 or depth > 100:
+            return jsonify(success=False, error="depth must be between 0 and 100."), 400
+
+        contracts_raw = request.args.get("contracts")
+        max_position_raw = request.args.get("max_position_dollars")
+
+        book_raw = get_orderbook(ticker, depth=depth)
+        book = normalize_orderbook(book_raw)
+        ask_levels = book["yes_asks"] if side == "YES" else book["no_asks"]
+
+        if contracts_raw is not None:
+            contracts = number(contracts_raw)
+            if contracts is None or contracts <= 0:
+                return jsonify(success=False, error="contracts must be positive."), 400
+            walk = walk_orderbook(ask_levels, contracts)
+            sizing = None
+            request_mode = "contracts"
+        else:
+            max_position = number(max_position_raw)
+            if max_position is None:
+                max_position = EXECUTION_DEFAULT_MAX_POSITION_DOLLARS
+            if max_position <= 0:
+                return jsonify(success=False, error="max_position_dollars must be positive."), 400
+            sizing = size_to_max_position_dollars(
+                ask_levels,
+                max_position,
+                KALSHI_TAKER_FEE_RATE
+            )
+            if not sizing.get("available"):
+                return jsonify(success=False, ticker=ticker, side=side, sizing=sizing), 400
+            walk = sizing.get("walk") or {}
+            contracts = sizing.get("final_contracts")
+            request_mode = "max_position_dollars"
+
+        fills = walk.get("fills") or []
+        if not fills or not walk.get("full_fill"):
+            return jsonify(
+                success=False,
+                ticker=ticker,
+                side=side,
+                error="Requested quantity could not be fully simulated from the available order book.",
+                orderbook_walk=walk
+            ), 400
+
+        comparison = documented_kalshi_fee_comparison(
+            fills,
+            KALSHI_TAKER_FEE_RATE
+        )
+
+        return jsonify(
+            success=True,
+            read_only=True,
+            ticker=ticker,
+            side=side,
+            request_mode=request_mode,
+            requested_contracts=contracts,
+            max_position_dollars=(
+                sizing.get("max_position_dollars") if sizing else None
+            ),
+            orderbook_walk=walk,
+            current_app_fee=estimated_kalshi_taker_fee(
+                fills,
+                KALSHI_TAKER_FEE_RATE
+            ),
+            documented_fee_comparison=comparison,
+            documentation_note=(
+                "Kalshi documents trade-fee rounding to $0.0001, cent-aligned "
+                "balance rounding, and an order-level rounding accumulator with "
+                "$0.01 rebates. Public order-book data does not expose how a "
+                "future order will be split into individual matches, so this "
+                "endpoint compares those mechanics at the simulated price-level "
+                "fill granularity."
+            )
+        )
+
+    except requests.RequestException as e:
+        return jsonify(success=False, error=str(e)), 502
+    except Exception as e:
+        return jsonify(success=False, error=str(e)), 500
+
+
 @app.get("/cfbd-test")
 def cfbd_test():
     if not CFBD_API_KEY:
