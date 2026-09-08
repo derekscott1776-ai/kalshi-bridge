@@ -4,6 +4,7 @@ import math
 import requests
 from datetime import datetime
 from difflib import SequenceMatcher
+from decimal import Decimal, ROUND_CEILING
 
 app = Flask(__name__)
 
@@ -15,6 +16,47 @@ CFBD_API_KEY = os.environ.get("CFBD_API_KEY", "").strip()
 # FBS-vs-FBS regular-season games from 2021-2025.
 CALIBRATED_HOME_FIELD_ELO = 67.0
 
+# ============================================================
+# EXECUTION-LAYER CONFIGURATION
+#
+# These settings affect ONLY execution-cost analysis.
+# They DO NOT change the probability model.
+#
+# Kalshi's general taker-fee schedule uses:
+#   fee = round up(rate * contracts * price * (1 - price))
+#
+# The default rate is configurable because some Kalshi markets
+# can use a different fee schedule.
+# ============================================================
+
+KALSHI_TAKER_FEE_RATE = float(
+    os.environ.get(
+        "KALSHI_TAKER_FEE_RATE",
+        "0.07"
+    )
+)
+
+EXECUTION_DEFAULT_CONTRACTS = int(
+    os.environ.get(
+        "EXECUTION_DEFAULT_CONTRACTS",
+        "1"
+    )
+)
+
+MAX_ALLOWED_SLIPPAGE_DOLLARS = float(
+    os.environ.get(
+        "MAX_ALLOWED_SLIPPAGE_DOLLARS",
+        "0.02"
+    )
+)
+
+MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS = float(
+    os.environ.get(
+        "MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS",
+        "0.05"
+    )
+)
+
 
 @app.get("/")
 def home():
@@ -22,7 +64,16 @@ def home():
         status="ok",
         message="Kalshi bridge is running",
         cfbd_configured=bool(CFBD_API_KEY),
-        calibrated_home_field_elo=CALIBRATED_HOME_FIELD_ELO
+        calibrated_home_field_elo=CALIBRATED_HOME_FIELD_ELO,
+        execution_layer={
+            "enabled": True,
+            "default_contracts": EXECUTION_DEFAULT_CONTRACTS,
+            "taker_fee_rate": KALSHI_TAKER_FEE_RATE,
+            "max_slippage_dollars":
+                MAX_ALLOWED_SLIPPAGE_DOLLARS,
+            "max_bid_ask_spread_dollars":
+                MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+        }
     )
 
 
@@ -150,6 +201,867 @@ def parse_iso_datetime(value):
         )
     except ValueError:
         return None
+
+
+# ============================================================
+# KALSHI ORDER-BOOK / EXECUTION LAYER
+# ============================================================
+
+def ceil_to_cent(value):
+    """
+    Round a positive dollar amount UP to the next cent.
+
+    Kalshi's published fee formula specifies round-up behavior.
+    """
+    value = Decimal(str(value))
+
+    if value <= 0:
+        return 0.0
+
+    return float(
+        value.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_CEILING
+        )
+    )
+
+
+def get_orderbook(ticker, depth=0):
+    """
+    Fetch the public Kalshi order book for one market.
+
+    Kalshi returns YES bids and NO bids. Because binary
+    contracts are complementary:
+        YES ask = 1 - NO bid
+        NO ask  = 1 - YES bid
+    """
+    return kalshi_get(
+        f"/markets/{ticker}/orderbook",
+        params={
+            "depth": depth
+        }
+    )
+
+
+def parse_orderbook_levels(levels):
+    parsed = []
+
+    for level in levels or []:
+        if (
+            not isinstance(level, (list, tuple))
+            or len(level) < 2
+        ):
+            continue
+
+        price = number(level[0])
+        quantity = number(level[1])
+
+        if (
+            price is None
+            or quantity is None
+            or price <= 0
+            or price >= 1
+            or quantity <= 0
+        ):
+            continue
+
+        parsed.append({
+            "price": price,
+            "quantity": quantity
+        })
+
+    return parsed
+
+
+def normalize_orderbook(orderbook_response):
+    """
+    Convert Kalshi's bid-only order book into explicit
+    YES/NO bid and ask ladders.
+    """
+    raw = (
+        orderbook_response.get(
+            "orderbook_fp",
+            {}
+        )
+        if isinstance(
+            orderbook_response,
+            dict
+        )
+        else {}
+    )
+
+    yes_bids = parse_orderbook_levels(
+        raw.get("yes_dollars")
+    )
+
+    no_bids = parse_orderbook_levels(
+        raw.get("no_dollars")
+    )
+
+    yes_bids.sort(
+        key=lambda level:
+            level["price"],
+        reverse=True
+    )
+
+    no_bids.sort(
+        key=lambda level:
+            level["price"],
+        reverse=True
+    )
+
+    yes_asks = [
+        {
+            "price": round(
+                1.0 - level["price"],
+                4
+            ),
+            "quantity":
+                level["quantity"]
+        }
+        for level in no_bids
+    ]
+
+    no_asks = [
+        {
+            "price": round(
+                1.0 - level["price"],
+                4
+            ),
+            "quantity":
+                level["quantity"]
+        }
+        for level in yes_bids
+    ]
+
+    yes_asks.sort(
+        key=lambda level:
+            level["price"]
+    )
+
+    no_asks.sort(
+        key=lambda level:
+            level["price"]
+    )
+
+    return {
+        "yes_bids": yes_bids,
+        "yes_asks": yes_asks,
+        "no_bids": no_bids,
+        "no_asks": no_asks
+    }
+
+
+def best_price(levels):
+    if not levels:
+        return None
+
+    return number(
+        levels[0].get(
+            "price"
+        )
+    )
+
+
+def book_spread(
+    bid_levels,
+    ask_levels
+):
+    best_bid = best_price(
+        bid_levels
+    )
+
+    best_ask = best_price(
+        ask_levels
+    )
+
+    if (
+        best_bid is None
+        or best_ask is None
+    ):
+        return None
+
+    return max(
+        0.0,
+        best_ask - best_bid
+    )
+
+
+def walk_orderbook(
+    ask_levels,
+    desired_contracts
+):
+    """
+    Simulate an immediate taker BUY by consuming asks from
+    cheapest to most expensive.
+
+    Returns weighted-average fill price, slippage from the
+    best ask, fill details, and whether the requested size
+    can be filled completely.
+    """
+    desired_contracts = number(
+        desired_contracts
+    )
+
+    if (
+        desired_contracts is None
+        or desired_contracts <= 0
+    ):
+        return {
+            "requested_contracts": 0,
+            "filled_contracts": 0,
+            "unfilled_contracts": 0,
+            "full_fill": False,
+            "best_ask": None,
+            "weighted_average_fill_price": None,
+            "slippage_dollars": None,
+            "gross_contract_cost": 0.0,
+            "fills": []
+        }
+
+    desired_contracts = float(
+        desired_contracts
+    )
+
+    remaining = desired_contracts
+    filled = 0.0
+    gross_cost = 0.0
+    fills = []
+
+    sorted_asks = sorted(
+        ask_levels or [],
+        key=lambda level:
+            level["price"]
+    )
+
+    best_ask = (
+        sorted_asks[0]["price"]
+        if sorted_asks
+        else None
+    )
+
+    for level in sorted_asks:
+        if remaining <= 0:
+            break
+
+        price = number(
+            level.get("price")
+        )
+
+        available = number(
+            level.get("quantity")
+        )
+
+        if (
+            price is None
+            or available is None
+            or available <= 0
+        ):
+            continue
+
+        fill_quantity = min(
+            remaining,
+            available
+        )
+
+        level_cost = (
+            fill_quantity
+            * price
+        )
+
+        fills.append({
+            "price": round(
+                price,
+                4
+            ),
+            "available_contracts":
+                round(
+                    available,
+                    4
+                ),
+            "filled_contracts":
+                round(
+                    fill_quantity,
+                    4
+                ),
+            "level_cost_dollars":
+                round(
+                    level_cost,
+                    4
+                )
+        })
+
+        filled += fill_quantity
+        gross_cost += level_cost
+        remaining -= fill_quantity
+
+    full_fill = (
+        remaining <= 0.0000001
+    )
+
+    average_fill_price = (
+        gross_cost / filled
+        if filled > 0
+        else None
+    )
+
+    slippage = (
+        average_fill_price - best_ask
+        if (
+            average_fill_price is not None
+            and best_ask is not None
+        )
+        else None
+    )
+
+    return {
+        "requested_contracts":
+            round(
+                desired_contracts,
+                4
+            ),
+        "filled_contracts":
+            round(
+                filled,
+                4
+            ),
+        "unfilled_contracts":
+            round(
+                max(
+                    0.0,
+                    desired_contracts - filled
+                ),
+                4
+            ),
+        "full_fill":
+            full_fill,
+        "best_ask":
+            (
+                round(
+                    best_ask,
+                    4
+                )
+                if best_ask is not None
+                else None
+            ),
+        "weighted_average_fill_price":
+            (
+                round(
+                    average_fill_price,
+                    6
+                )
+                if average_fill_price is not None
+                else None
+            ),
+        "slippage_dollars":
+            (
+                round(
+                    max(
+                        0.0,
+                        slippage
+                    ),
+                    6
+                )
+                if slippage is not None
+                else None
+            ),
+        "gross_contract_cost":
+            round(
+                gross_cost,
+                4
+            ),
+        "fills":
+            fills
+    }
+
+
+def estimated_kalshi_taker_fee(
+    fills,
+    fee_rate=None
+):
+    """
+    Estimate taker fees conservatively.
+
+    The default general Kalshi formula is:
+        rate * contracts * price * (1 - price)
+
+    Because a market order can sweep multiple price levels,
+    this estimates the fee at each executed price level and
+    rounds each level upward to the next cent. This is
+    intentionally conservative.
+
+    KALSHI_TAKER_FEE_RATE is configurable because particular
+    Kalshi markets can use different fee schedules.
+    """
+    if fee_rate is None:
+        fee_rate = (
+            KALSHI_TAKER_FEE_RATE
+        )
+
+    fee_rate = number(
+        fee_rate
+    )
+
+    if (
+        fee_rate is None
+        or fee_rate < 0
+    ):
+        return {
+            "fee_rate": None,
+            "estimated_fee_dollars": None,
+            "fee_details": []
+        }
+
+    total_fee = 0.0
+    fee_details = []
+
+    for fill in fills or []:
+        quantity = number(
+            fill.get(
+                "filled_contracts"
+            )
+        )
+
+        price = number(
+            fill.get(
+                "price"
+            )
+        )
+
+        if (
+            quantity is None
+            or price is None
+            or quantity <= 0
+            or price <= 0
+            or price >= 1
+        ):
+            continue
+
+        raw_fee = (
+            fee_rate
+            * quantity
+            * price
+            * (1.0 - price)
+        )
+
+        rounded_fee = (
+            ceil_to_cent(
+                raw_fee
+            )
+        )
+
+        total_fee += rounded_fee
+
+        fee_details.append({
+            "price":
+                round(
+                    price,
+                    4
+                ),
+            "contracts":
+                round(
+                    quantity,
+                    4
+                ),
+            "raw_formula_fee_dollars":
+                round(
+                    raw_fee,
+                    6
+                ),
+            "estimated_rounded_fee_dollars":
+                round(
+                    rounded_fee,
+                    2
+                )
+        })
+
+    return {
+        "fee_rate":
+            fee_rate,
+        "fee_rounding":
+            (
+                "Conservative estimate: "
+                "formula applied and rounded "
+                "up separately at each price level."
+            ),
+        "estimated_fee_dollars":
+            round(
+                total_fee,
+                2
+            ),
+        "fee_details":
+            fee_details
+    }
+
+
+def execution_side_metrics(
+    side,
+    fair_probability,
+    bid_levels,
+    ask_levels,
+    desired_contracts
+):
+    """
+    Evaluate one BUY side (YES or NO) using actual order-book
+    depth, weighted fill price, estimated taker fees, spread,
+    slippage, and execution-adjusted net edge.
+    """
+    fair_probability = (
+        clamp_probability(
+            fair_probability
+        )
+    )
+
+    walk = walk_orderbook(
+        ask_levels,
+        desired_contracts
+    )
+
+    spread = book_spread(
+        bid_levels,
+        ask_levels
+    )
+
+    fee = estimated_kalshi_taker_fee(
+        walk.get(
+            "fills",
+            []
+        )
+    )
+
+    filled_contracts = number(
+        walk.get(
+            "filled_contracts"
+        )
+    )
+
+    gross_cost = number(
+        walk.get(
+            "gross_contract_cost"
+        )
+    )
+
+    fee_total = number(
+        fee.get(
+            "estimated_fee_dollars"
+        )
+    )
+
+    all_in_cost_per_contract = None
+    net_edge = None
+    net_roi = None
+    expected_profit_total = None
+
+    if (
+        filled_contracts is not None
+        and filled_contracts > 0
+        and gross_cost is not None
+        and fee_total is not None
+    ):
+        all_in_total = (
+            gross_cost
+            + fee_total
+        )
+
+        all_in_cost_per_contract = (
+            all_in_total
+            / filled_contracts
+        )
+
+        if (
+            fair_probability is not None
+            and walk.get(
+                "full_fill"
+            )
+        ):
+            net_edge = (
+                fair_probability
+                - all_in_cost_per_contract
+            )
+
+            if (
+                all_in_cost_per_contract
+                > 0
+            ):
+                net_roi = (
+                    net_edge
+                    / all_in_cost_per_contract
+                )
+
+            expected_profit_total = (
+                net_edge
+                * filled_contracts
+            )
+
+    slippage = number(
+        walk.get(
+            "slippage_dollars"
+        )
+    )
+
+    spread_pass = (
+        spread is not None
+        and spread
+        <= MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+    )
+
+    slippage_pass = (
+        slippage is not None
+        and slippage
+        <= MAX_ALLOWED_SLIPPAGE_DOLLARS
+    )
+
+    full_fill_pass = bool(
+        walk.get(
+            "full_fill"
+        )
+    )
+
+    liquidity_pass = (
+        full_fill_pass
+        and slippage_pass
+        and spread_pass
+    )
+
+    best_ask = number(
+        walk.get(
+            "best_ask"
+        )
+    )
+
+    gross_edge = (
+        fair_probability - best_ask
+        if (
+            fair_probability is not None
+            and best_ask is not None
+        )
+        else None
+    )
+
+    return {
+        "side":
+            side,
+        "fair_probability":
+            (
+                round(
+                    fair_probability,
+                    6
+                )
+                if fair_probability is not None
+                else None
+            ),
+        "requested_contracts":
+            walk.get(
+                "requested_contracts"
+            ),
+        "orderbook_walk":
+            walk,
+        "best_bid":
+            (
+                round(
+                    best_price(
+                        bid_levels
+                    ),
+                    4
+                )
+                if best_price(
+                    bid_levels
+                ) is not None
+                else None
+            ),
+        "best_ask":
+            walk.get(
+                "best_ask"
+            ),
+        "bid_ask_spread":
+            (
+                round(
+                    spread,
+                    6
+                )
+                if spread is not None
+                else None
+            ),
+        "fee":
+            fee,
+        "all_in_cost_per_contract":
+            (
+                round(
+                    all_in_cost_per_contract,
+                    6
+                )
+                if all_in_cost_per_contract
+                is not None
+                else None
+            ),
+        "gross_edge_before_fees_and_slippage":
+            (
+                round(
+                    gross_edge,
+                    6
+                )
+                if gross_edge is not None
+                else None
+            ),
+        "gross_edge_percentage_points":
+            (
+                round(
+                    gross_edge * 100,
+                    2
+                )
+                if gross_edge is not None
+                else None
+            ),
+        "net_execution_edge":
+            (
+                round(
+                    net_edge,
+                    6
+                )
+                if net_edge is not None
+                else None
+            ),
+        "net_execution_edge_percentage_points":
+            (
+                round(
+                    net_edge * 100,
+                    2
+                )
+                if net_edge is not None
+                else None
+            ),
+        "net_expected_roi":
+            (
+                round(
+                    net_roi,
+                    6
+                )
+                if net_roi is not None
+                else None
+            ),
+        "net_expected_roi_percent":
+            (
+                round(
+                    net_roi * 100,
+                    2
+                )
+                if net_roi is not None
+                else None
+            ),
+        "expected_profit_for_requested_size":
+            (
+                round(
+                    expected_profit_total,
+                    4
+                )
+                if expected_profit_total
+                is not None
+                else None
+            ),
+        "checks": {
+            "full_fill":
+                full_fill_pass,
+            "spread_pass":
+                spread_pass,
+            "slippage_pass":
+                slippage_pass,
+            "liquidity_pass":
+                liquidity_pass,
+            "max_allowed_spread_dollars":
+                MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS,
+            "max_allowed_slippage_dollars":
+                MAX_ALLOWED_SLIPPAGE_DOLLARS
+        }
+    }
+
+
+def build_execution_analysis(
+    ticker,
+    fair_yes_probability,
+    desired_contracts
+):
+    """
+    Fetch one order book and evaluate BUY YES and BUY NO
+    from the same snapshot.
+    """
+    fair_yes = clamp_probability(
+        fair_yes_probability
+    )
+
+    if fair_yes is None:
+        return {
+            "available": False,
+            "reason":
+                "No independent fair probability is available."
+        }
+
+    fair_no = 1.0 - fair_yes
+
+    try:
+        raw_orderbook = (
+            get_orderbook(
+                ticker,
+                depth=0
+            )
+        )
+
+        book = normalize_orderbook(
+            raw_orderbook
+        )
+
+        return {
+            "available": True,
+            "ticker":
+                ticker,
+            "desired_contracts":
+                desired_contracts,
+            "fee_configuration": {
+                "taker_fee_rate":
+                    KALSHI_TAKER_FEE_RATE,
+                "rate_source":
+                    (
+                        "Configurable default. "
+                        "Override with the "
+                        "KALSHI_TAKER_FEE_RATE "
+                        "environment variable when "
+                        "a market uses a different "
+                        "fee schedule."
+                    )
+            },
+            "liquidity_configuration": {
+                "max_allowed_slippage_dollars":
+                    MAX_ALLOWED_SLIPPAGE_DOLLARS,
+                "max_allowed_bid_ask_spread_dollars":
+                    MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
+            },
+            "yes": execution_side_metrics(
+                "YES",
+                fair_yes,
+                book["yes_bids"],
+                book["yes_asks"],
+                desired_contracts
+            ),
+            "no": execution_side_metrics(
+                "NO",
+                fair_no,
+                book["no_bids"],
+                book["no_asks"],
+                desired_contracts
+            )
+        }
+
+    except requests.RequestException as e:
+        return {
+            "available": False,
+            "ticker":
+                ticker,
+            "reason":
+                (
+                    "Kalshi order-book request failed."
+                ),
+            "error":
+                str(e)
+        }
 
 
 # ============================================================
@@ -1094,7 +2006,8 @@ def expected_metrics(
 def analysis_market(
     m,
     market_type,
-    fair_yes_probability=None
+    fair_yes_probability=None,
+    desired_contracts=None
 ):
     yes_bid = number(
         m.get(
@@ -1169,6 +2082,26 @@ def analysis_market(
         else None
     )
 
+    if desired_contracts is None:
+        desired_contracts = (
+            EXECUTION_DEFAULT_CONTRACTS
+        )
+
+    execution = None
+
+    if (
+        market_type == "winner"
+        and fair_yes is not None
+        and m.get("ticker")
+    ):
+        execution = (
+            build_execution_analysis(
+                m.get("ticker"),
+                fair_yes,
+                desired_contracts
+            )
+        )
+
     return {
         "market_type":
             market_type,
@@ -1214,6 +2147,9 @@ def analysis_market(
         "fair_probability_supplied":
             fair_yes is not None,
 
+        "execution_analysis":
+            execution,
+
         "yes_evaluation":
             expected_metrics(
                 fair_yes,
@@ -1231,7 +2167,8 @@ def analysis_market(
 def analysis_candidates(
     markets,
     market_type,
-    fair_probabilities=None
+    fair_probabilities=None,
+    desired_contracts=None
 ):
     fair_probabilities = (
         fair_probabilities
@@ -1250,7 +2187,8 @@ def analysis_candidates(
             market_type,
             fair_probabilities.get(
                 ticker
-            )
+            ),
+            desired_contracts
         )
 
         if (
@@ -1406,6 +2344,60 @@ def market(ticker):
         return jsonify(
             kalshi_get(
                 f"/markets/{ticker}"
+            )
+        )
+
+    except requests.RequestException as e:
+        return jsonify(
+            error=str(e)
+        ), 502
+
+
+@app.get("/orderbook/<ticker>")
+def orderbook(ticker):
+    try:
+        depth_text = request.args.get(
+            "depth",
+            "0"
+        ).strip()
+
+        try:
+            depth = int(
+                depth_text
+            )
+        except ValueError:
+            return jsonify(
+                error=(
+                    "depth must be an integer "
+                    "from 0 to 100."
+                )
+            ), 400
+
+        if depth < 0 or depth > 100:
+            return jsonify(
+                error=(
+                    "depth must be between "
+                    "0 and 100."
+                )
+            ), 400
+
+        raw = get_orderbook(
+            ticker,
+            depth=depth
+        )
+
+        normalized = (
+            normalize_orderbook(
+                raw
+            )
+        )
+
+        return jsonify(
+            ticker=ticker,
+            depth=depth,
+            raw_orderbook=raw,
+            normalized_orderbook=(
+                normalized
             )
         )
 
@@ -1620,6 +2612,36 @@ def analyze():
         ""
     ).strip()
 
+    contracts_text = request.args.get(
+        "contracts",
+        str(
+            EXECUTION_DEFAULT_CONTRACTS
+        )
+    ).strip()
+
+    try:
+        desired_contracts = int(
+            contracts_text
+        )
+    except ValueError:
+        return jsonify(
+            error=(
+                "contracts must be a whole "
+                "number from 1 to 10000."
+            )
+        ), 400
+
+    if (
+        desired_contracts < 1
+        or desired_contracts > 10000
+    ):
+        return jsonify(
+            error=(
+                "contracts must be between "
+                "1 and 10000."
+            )
+        ), 400
+
     valid, message = (
         validate_values(
             team,
@@ -1682,7 +2704,8 @@ def analyze():
                     "game_winner"
                 ],
                 "winner",
-                winner_probabilities
+                winner_probabilities,
+                desired_contracts
             )
         )
 
@@ -1763,30 +2786,52 @@ def analyze():
 
                 "edge":
                     (
-                        "Independent fair "
-                        "probability minus "
-                        "executable ask price."
+                        "Raw edge remains independent "
+                        "fair probability minus the "
+                        "displayed executable ask. "
+                        "Winner markets also include "
+                        "execution-adjusted net edge "
+                        "after walking the order book "
+                        "and estimating taker fees."
                     ),
 
                 "expected_profit":
                     (
-                        "Fair probability minus "
-                        "contract cost."
+                        "Execution-adjusted expected "
+                        "profit uses fair probability "
+                        "minus all-in cost per contract."
                     ),
 
                 "expected_roi":
                     (
-                        "Expected profit divided "
-                        "by contract cost."
+                        "Execution-adjusted expected "
+                        "ROI is net edge divided by "
+                        "all-in cost per contract."
+                    ),
+
+                "execution_layer":
+                    (
+                        "For modeled winner contracts, "
+                        "the bridge derives asks from "
+                        "the reciprocal Kalshi bid book, "
+                        "walks the requested size, "
+                        "calculates a weighted-average "
+                        "fill price, estimates taker "
+                        "fees, measures slippage and "
+                        "spread, and applies liquidity "
+                        "checks."
                     ),
 
                 "limitations":
                     (
-                        "Fees, slippage, injuries, "
-                        "weather, matchup efficiency, "
-                        "roster changes and model "
-                        "calibration beyond Elo plus "
-                        "home field are not yet included."
+                        "Injuries, weather, matchup "
+                        "efficiency, roster changes and "
+                        "model calibration beyond Elo "
+                        "plus home field are not yet "
+                        "included. Fee estimates use a "
+                        "configurable default schedule "
+                        "and should be changed for "
+                        "markets with special fee terms."
                     )
             },
 
@@ -1805,6 +2850,17 @@ def analyze():
                     data[
                         "total_event"
                     ]
+            },
+
+            execution_request={
+                "contracts":
+                    desired_contracts,
+                "taker_fee_rate":
+                    KALSHI_TAKER_FEE_RATE,
+                "max_allowed_slippage_dollars":
+                    MAX_ALLOWED_SLIPPAGE_DOLLARS,
+                "max_allowed_bid_ask_spread_dollars":
+                    MAX_ALLOWED_BID_ASK_SPREAD_DOLLARS
             },
 
             summary={
@@ -3324,4 +4380,3 @@ def walk_forward_elo_model():
             success=False,
             error=str(e)
         ), 502
-
