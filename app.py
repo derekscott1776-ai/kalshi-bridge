@@ -2605,6 +2605,10 @@ def fee_audit(ticker):
     Audit the bridge's current multi-level fee estimate against Kalshi's
     documented fee-rounding mechanics for a simulated market buy.
 
+    This route intentionally normalizes its own private copy of the ask
+    ladder before any comparison or sorting. It does not modify /analyze
+    or the execution functions used by /analyze.
+
     Query parameters:
       side=YES|NO                    default YES
       contracts=<positive number>   optional
@@ -2613,57 +2617,166 @@ def fee_audit(ticker):
 
     This endpoint is read-only. It does not place an order.
     """
+    audit_stage = "request_validation"
+
     try:
         side = request.args.get("side", "YES").strip().upper()
         if side not in {"YES", "NO"}:
-            return jsonify(success=False, error="side must be YES or NO."), 400
+            return jsonify(
+                success=False,
+                stage=audit_stage,
+                error="side must be YES or NO."
+            ), 400
 
-        depth = request.args.get("depth", "0", type=int)
-        if depth is None or depth < 0 or depth > 100:
-            return jsonify(success=False, error="depth must be between 0 and 100."), 400
+        depth_text = request.args.get("depth", "0").strip()
+        try:
+            depth = int(depth_text)
+        except (TypeError, ValueError):
+            return jsonify(
+                success=False,
+                stage=audit_stage,
+                error="depth must be an integer from 0 to 100."
+            ), 400
+
+        if depth < 0 or depth > 100:
+            return jsonify(
+                success=False,
+                stage=audit_stage,
+                error="depth must be between 0 and 100."
+            ), 400
 
         contracts_raw = request.args.get("contracts")
         max_position_raw = request.args.get("max_position_dollars")
 
+        audit_stage = "orderbook_fetch"
         book_raw = get_orderbook(ticker, depth=depth)
+
+        audit_stage = "orderbook_normalization"
         book = normalize_orderbook(book_raw)
-        ask_levels = book["yes_asks"] if side == "YES" else book["no_asks"]
+        source_asks = (
+            book.get("yes_asks", [])
+            if side == "YES"
+            else book.get("no_asks", [])
+        )
+
+        # Audit-only defensive normalization.  Every price and quantity is
+        # converted to float BEFORE sorting/comparison so a string returned
+        # anywhere upstream cannot be compared with an int/float.
+        audit_ask_levels = []
+        rejected_levels = 0
+
+        for level in source_asks or []:
+            if not isinstance(level, dict):
+                rejected_levels += 1
+                continue
+
+            price = number(level.get("price"))
+            quantity = number(level.get("quantity"))
+
+            if (
+                price is None
+                or quantity is None
+                or price <= 0
+                or price >= 1
+                or quantity <= 0
+            ):
+                rejected_levels += 1
+                continue
+
+            audit_ask_levels.append({
+                "price": float(price),
+                "quantity": float(quantity)
+            })
+
+        audit_ask_levels.sort(
+            key=lambda level: float(level["price"])
+        )
+
+        if not audit_ask_levels:
+            return jsonify(
+                success=False,
+                stage=audit_stage,
+                ticker=ticker,
+                side=side,
+                error="No executable numeric ask levels are available for the audit.",
+                rejected_levels=rejected_levels
+            ), 400
+
+        audit_stage = "position_sizing"
 
         if contracts_raw is not None:
             contracts = number(contracts_raw)
             if contracts is None or contracts <= 0:
-                return jsonify(success=False, error="contracts must be positive."), 400
-            walk = walk_orderbook(ask_levels, contracts)
+                return jsonify(
+                    success=False,
+                    stage=audit_stage,
+                    error="contracts must be positive."
+                ), 400
+
+            walk = walk_orderbook(
+                audit_ask_levels,
+                float(contracts)
+            )
             sizing = None
             request_mode = "contracts"
+            max_position = None
+
         else:
             max_position = number(max_position_raw)
             if max_position is None:
                 max_position = EXECUTION_DEFAULT_MAX_POSITION_DOLLARS
-            if max_position <= 0:
-                return jsonify(success=False, error="max_position_dollars must be positive."), 400
-            sizing = size_to_max_position_dollars(
-                ask_levels,
-                max_position,
+
+            if max_position is None or max_position <= 0:
+                return jsonify(
+                    success=False,
+                    stage=audit_stage,
+                    error="max_position_dollars must be positive."
+                ), 400
+
+            # Reuse the already-working affordability routine with the
+            # audit-only normalized ladder.  This does not change /analyze.
+            sizing = max_affordable_contracts(
+                audit_ask_levels,
+                float(max_position),
                 KALSHI_TAKER_FEE_RATE
             )
+
             if not sizing.get("available"):
-                return jsonify(success=False, ticker=ticker, side=side, sizing=sizing), 400
+                return jsonify(
+                    success=False,
+                    stage=audit_stage,
+                    ticker=ticker,
+                    side=side,
+                    sizing=sizing
+                ), 400
+
             walk = sizing.get("walk") or {}
             contracts = sizing.get("final_contracts")
             request_mode = "max_position_dollars"
 
+        audit_stage = "fill_validation"
         fills = walk.get("fills") or []
-        if not fills or not walk.get("full_fill"):
+
+        if not fills or not bool(walk.get("full_fill")):
             return jsonify(
                 success=False,
+                stage=audit_stage,
                 ticker=ticker,
                 side=side,
-                error="Requested quantity could not be fully simulated from the available order book.",
+                error=(
+                    "Requested quantity could not be fully simulated "
+                    "from the available order book."
+                ),
                 orderbook_walk=walk
             ), 400
 
+        audit_stage = "fee_comparison"
         comparison = documented_kalshi_fee_comparison(
+            fills,
+            KALSHI_TAKER_FEE_RATE
+        )
+
+        current_fee = estimated_kalshi_taker_fee(
             fills,
             KALSHI_TAKER_FEE_RATE
         )
@@ -2671,33 +2784,49 @@ def fee_audit(ticker):
         return jsonify(
             success=True,
             read_only=True,
+            audit_stage="complete",
             ticker=ticker,
             side=side,
             request_mode=request_mode,
             requested_contracts=contracts,
             max_position_dollars=(
-                sizing.get("max_position_dollars") if sizing else None
+                round(float(max_position), 2)
+                if max_position is not None
+                else None
             ),
+            audit_input_normalization={
+                "accepted_ask_levels": len(audit_ask_levels),
+                "rejected_ask_levels": rejected_levels,
+                "prices_and_quantities_forced_numeric": True
+            },
             orderbook_walk=walk,
-            current_app_fee=estimated_kalshi_taker_fee(
-                fills,
-                KALSHI_TAKER_FEE_RATE
-            ),
+            sizing=sizing,
+            current_app_fee=current_fee,
             documented_fee_comparison=comparison,
             documentation_note=(
-                "Kalshi documents trade-fee rounding to $0.0001, cent-aligned "
-                "balance rounding, and an order-level rounding accumulator with "
-                "$0.01 rebates. Public order-book data does not expose how a "
-                "future order will be split into individual matches, so this "
-                "endpoint compares those mechanics at the simulated price-level "
-                "fill granularity."
+                "The audit compares the bridge's current per-price-level "
+                "penny-ceiling estimate with the documented fee mechanics "
+                "at simulated price-level granularity. Public order-book "
+                "data does not reveal the future match-by-match segmentation "
+                "of an order, so this remains a simulation rather than a "
+                "claim of the exact exchange-billed fee."
             )
         )
 
     except requests.RequestException as e:
-        return jsonify(success=False, error=str(e)), 502
+        return jsonify(
+            success=False,
+            stage=audit_stage,
+            error=str(e)
+        ), 502
+
     except Exception as e:
-        return jsonify(success=False, error=str(e)), 500
+        return jsonify(
+            success=False,
+            stage=audit_stage,
+            error_type=type(e).__name__,
+            error=str(e)
+        ), 500
 
 
 @app.get("/cfbd-test")
