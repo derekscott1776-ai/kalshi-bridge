@@ -3,7 +3,7 @@ import os
 import math
 import requests
 import psycopg
-from pathlib import Path
+import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
 from decimal import Decimal, ROUND_CEILING
@@ -20,7 +20,6 @@ app = Flask(__name__)
 # ============================================================
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DATABASE_MIGRATION_FILE = "001_initial_schema.sql"
 EXPECTED_DB_TABLES = (
     "settings",
     "scans",
@@ -89,53 +88,639 @@ def db_health():
         ), 500
 
 
-@app.get("/db/migrate")
-def db_migrate():
-    """
-    Run the repository's fixed initial schema migration, then verify
-    that all five required V1 tables exist. No caller-supplied SQL is
-    accepted, and database credentials are never returned.
-    """
+
+
+# ============================================================
+# DATABASE PERSISTENCE HELPERS
+#
+# Milestone 2: persist one real matchup analysis as a scan plus
+# immutable recommendation rows. These helpers write only to the
+# analytics database. They never place, modify, or cancel Kalshi
+# orders.
+# ============================================================
+
+LIVE_MODEL_VERSION = "cfbd-pregame-elo-hfa-v4-walk-forward"
+DEFAULT_BANKROLL_DOLLARS = 800.0
+DEFAULT_MAX_OPEN_RISK_DOLLARS = 240.0
+
+
+def db_numeric_setting(conn, key, default_value):
     try:
-        schema_path = Path(__file__).resolve().with_name(
-            DATABASE_MIGRATION_FILE
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM settings WHERE key = %s",
+                (key,),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return float(default_value)
+
+        return float(row[0])
+    except (TypeError, ValueError):
+        return float(default_value)
+
+
+def create_scan_record(game_date, max_position_dollars):
+    scan_uuid = uuid.uuid4()
+
+    with get_db_connection() as conn:
+        bankroll = db_numeric_setting(
+            conn,
+            "bankroll_dollars",
+            DEFAULT_BANKROLL_DOLLARS,
+        )
+        max_open_risk = db_numeric_setting(
+            conn,
+            "max_open_risk_dollars",
+            DEFAULT_MAX_OPEN_RISK_DOLLARS,
         )
 
-        if not schema_path.exists():
-            return jsonify(
-                success=False,
-                migration="error",
-                error=f"{DATABASE_MIGRATION_FILE} was not found",
-            ), 500
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scans (
+                    scan_uuid,
+                    sport,
+                    market_type,
+                    scan_date,
+                    model_version,
+                    home_field_elo,
+                    elo_scale,
+                    bankroll_dollars,
+                    max_position_dollars,
+                    max_open_risk_dollars,
+                    status
+                )
+                VALUES (
+                    %s, 'college_football', 'winner', %s, %s,
+                    %s, %s, %s, %s, %s, 'RUNNING'
+                )
+                RETURNING id
+                """,
+                (
+                    scan_uuid,
+                    game_date,
+                    LIVE_MODEL_VERSION,
+                    LIVE_HOME_FIELD_ELO,
+                    LIVE_ELO_SCALE,
+                    bankroll,
+                    max_position_dollars,
+                    max_open_risk,
+                ),
+            )
+            scan_id = cur.fetchone()[0]
 
-        schema_sql = schema_path.read_text(encoding="utf-8")
+        conn.commit()
 
+    return {
+        "scan_id": scan_id,
+        "scan_uuid": str(scan_uuid),
+    }
+
+
+def mark_scan_failed(scan_id, error_message):
+    try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(schema_sql, prepare=False)
+                cur.execute(
+                    """
+                    UPDATE scans
+                    SET status = 'FAILED',
+                        error_message = %s,
+                        completed_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (str(error_message)[:4000], scan_id),
+                )
             conn.commit()
-            table_status = database_table_status(conn)
+    except Exception:
+        # Never hide the original scanner error with a secondary
+        # database-status update failure.
+        pass
 
-        status_code = 200 if table_status["all_tables_present"] else 500
 
-        return jsonify(
-            success=table_status["all_tables_present"],
-            migration=(
-                "complete"
-                if table_status["all_tables_present"]
-                else "incomplete"
-            ),
-            migration_file=DATABASE_MIGRATION_FILE,
-            **table_status,
-        ), status_code
+def winner_contract_team(market, team, opponent):
+    team_score = winner_identity_score(team, market)
+    opponent_score = winner_identity_score(opponent, market)
 
-    except Exception as e:
-        return jsonify(
-            success=False,
-            migration="error",
-            error_type=type(e).__name__,
-            error=str(e),
-        ), 500
+    if team_score > opponent_score:
+        return team
+    if opponent_score > team_score:
+        return opponent
+
+    return None
+
+
+def selected_decision_for_market(
+    market,
+    matchup_decision,
+    represented_team,
+    team,
+    opponent,
+):
+    selected_ticker = matchup_decision.get("ticker")
+    selected_action = str(matchup_decision.get("action", "PASS"))
+
+    if (
+        selected_ticker == market.get("ticker")
+        and selected_action in {"BUY YES", "BUY NO"}
+    ):
+        action = selected_action
+        side = matchup_decision.get("side")
+        decision_data = matchup_decision
+    else:
+        action = "PASS"
+        side = None
+        execution = market.get("execution_analysis") or {}
+        engine = execution.get("decision_engine") or {}
+        market_decision = engine.get("market_decision") or {}
+        decision_data = market_decision
+
+    if action == "BUY YES":
+        exposure_team = represented_team or market.get("ticker")
+    elif action == "BUY NO":
+        if represented_team == team:
+            exposure_team = opponent
+        elif represented_team == opponent:
+            exposure_team = team
+        else:
+            exposure_team = market.get("ticker")
+    else:
+        exposure_team = market.get("ticker")
+
+    event_ticker = str(market.get("ticker") or "").rsplit("-", 1)[0]
+    exposure_token = normalize(exposure_team) or "unknown"
+
+    if action in {"BUY YES", "BUY NO"}:
+        economic_exposure_key = f"{event_ticker}:{exposure_token}_win"
+    else:
+        economic_exposure_key = f"{market.get('ticker')}:pass"
+
+    return action, side, decision_data, economic_exposure_key
+
+
+def best_failed_execution(market):
+    execution = market.get("execution_analysis") or {}
+    engine = execution.get("decision_engine") or {}
+    attempts = []
+
+    for side_name in ("yes", "no"):
+        side_decision = engine.get(side_name) or {}
+        candidate = side_decision.get("best_failed_attempt")
+        if candidate:
+            attempts.append(candidate)
+
+    if not attempts:
+        return None
+
+    return max(
+        attempts,
+        key=lambda attempt: (
+            number(attempt.get("net_edge")) or -999,
+            number(attempt.get("net_roi")) or -999,
+        ),
+    )
+
+
+def recommendation_values(
+    market,
+    team,
+    opponent,
+    game_date,
+    event_ticker,
+    probability_model,
+    matchup_decision,
+    recommendation_rank,
+):
+    represented_team = winner_contract_team(
+        market,
+        team,
+        opponent,
+    )
+
+    action, side, decision_data, economic_exposure_key = (
+        selected_decision_for_market(
+            market,
+            matchup_decision,
+            represented_team,
+            team,
+            opponent,
+        )
+    )
+
+    fair_yes = None
+    if represented_team == team:
+        fair_yes = probability_model.get("team_fair_probability")
+    elif represented_team == opponent:
+        fair_yes = probability_model.get("opponent_fair_probability")
+
+    fair_probability = fair_yes
+    if side == "NO" and fair_yes is not None:
+        fair_probability = 1.0 - fair_yes
+
+    yes_bid = number(market.get("yes_bid"))
+    yes_ask = number(market.get("yes_ask"))
+    no_bid = number(market.get("no_bid"))
+    no_ask = number(market.get("no_ask"))
+
+    if side == "YES":
+        bid_price = yes_bid
+        ask_price = yes_ask
+    elif side == "NO":
+        bid_price = no_bid
+        ask_price = no_ask
+    else:
+        bid_price = yes_bid
+        ask_price = yes_ask
+
+    failure_reason = None
+    metrics = None
+
+    if action in {"BUY YES", "BUY NO"}:
+        approved_tier = number(decision_data.get("approved_tier_dollars"))
+        contracts = number(decision_data.get("contracts"))
+        weighted_fill = number(
+            decision_data.get("weighted_average_fill_price")
+        )
+        all_in_cost = number(
+            decision_data.get("all_in_total_cost_dollars")
+        )
+        estimated_fee = number(decision_data.get("fee_dollars"))
+        net_edge = number(decision_data.get("net_edge"))
+        net_roi = number(decision_data.get("net_roi"))
+        spread = number(decision_data.get("spread_dollars"))
+        slippage = number(decision_data.get("slippage_dollars"))
+        liquidity = number(
+            decision_data.get("liquidity_coverage_ratio")
+        )
+
+        execution = market.get("execution_analysis") or {}
+        side_metrics = execution.get(str(side).lower()) or {}
+        gross_cost = number(
+            side_metrics.get("gross_contract_cost_dollars")
+        )
+        all_in_per_contract = number(
+            side_metrics.get("all_in_cost_per_contract")
+        )
+        expected_profit = number(
+            side_metrics.get("expected_profit_for_position")
+        )
+        best_ask = number(side_metrics.get("best_ask"))
+        gross_edge = (
+            fair_probability - best_ask
+            if fair_probability is not None and best_ask is not None
+            else None
+        )
+        full_fill = bool(
+            side_metrics.get("orderbook_walk", {}).get("full_fill")
+        )
+    else:
+        approved_tier = None
+        contracts = None
+        weighted_fill = None
+        all_in_cost = None
+        estimated_fee = None
+        net_edge = None
+        net_roi = None
+        spread = number(market.get("yes_bid_ask_spread"))
+        slippage = None
+        liquidity = None
+        gross_cost = None
+        all_in_per_contract = None
+        expected_profit = None
+        gross_edge = None
+        full_fill = None
+
+        failed = best_failed_execution(market)
+        if failed:
+            metrics = failed
+            net_edge = number(failed.get("net_edge"))
+            net_roi = number(failed.get("net_roi"))
+            spread = number(failed.get("spread_dollars"))
+            slippage = number(failed.get("slippage_dollars"))
+            liquidity = number(
+                (failed.get("liquidity") or {}).get("coverage_ratio")
+            )
+            failure_reason = "; ".join(failed.get("fail_reasons") or [])
+
+        if not failure_reason:
+            failure_reason = str(
+                decision_data.get("reason")
+                or "Market did not qualify for a BUY recommendation."
+            )
+
+    return {
+        "sport": "college_football",
+        "market_type": "winner",
+        "game_date": game_date,
+        "team": represented_team,
+        "opponent": (
+            opponent
+            if represented_team == team
+            else team if represented_team == opponent else opponent
+        ),
+        "event_ticker": event_ticker,
+        "ticker": market.get("ticker"),
+        "side": side,
+        "economic_exposure_key": economic_exposure_key,
+        "model_version": probability_model.get("model_version") or LIVE_MODEL_VERSION,
+        "fair_probability": fair_probability,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "last_price": number(market.get("last_price")),
+        "recommended_position_dollars": approved_tier,
+        "recommended_contracts": contracts,
+        "weighted_fill_price": weighted_fill,
+        "gross_contract_cost": gross_cost,
+        "estimated_fee": estimated_fee,
+        "all_in_cost": all_in_cost,
+        "all_in_cost_per_contract": all_in_per_contract,
+        "gross_edge": gross_edge,
+        "net_edge": net_edge,
+        "net_roi": net_roi,
+        "expected_profit": expected_profit,
+        "spread_dollars": spread,
+        "slippage_dollars": slippage,
+        "liquidity_coverage": liquidity,
+        "full_fill": full_fill,
+        "decision": action,
+        "failure_reason": failure_reason,
+        "recommendation_rank": recommendation_rank,
+        "volume": number(market.get("volume")),
+        "volume_24h": number(market.get("volume_24h")),
+        "open_interest": number(market.get("open_interest")),
+    }
+
+
+def persist_scan_results(
+    scan_id,
+    team,
+    opponent,
+    game_date,
+    event_ticker,
+    probability_model,
+    winner_candidates,
+    matchup_decision,
+):
+    persisted = []
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            for rank, market in enumerate(winner_candidates, start=1):
+                values = recommendation_values(
+                    market,
+                    team,
+                    opponent,
+                    game_date,
+                    event_ticker,
+                    probability_model,
+                    matchup_decision,
+                    rank,
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO recommendations (
+                        scan_id,
+                        sport,
+                        market_type,
+                        game_date,
+                        team,
+                        opponent,
+                        event_ticker,
+                        ticker,
+                        side,
+                        economic_exposure_key,
+                        model_version,
+                        fair_probability,
+                        bid_price,
+                        ask_price,
+                        last_price,
+                        recommended_position_dollars,
+                        recommended_contracts,
+                        weighted_fill_price,
+                        gross_contract_cost,
+                        estimated_fee,
+                        all_in_cost,
+                        all_in_cost_per_contract,
+                        gross_edge,
+                        net_edge,
+                        net_roi,
+                        expected_profit,
+                        spread_dollars,
+                        slippage_dollars,
+                        liquidity_coverage,
+                        full_fill,
+                        decision,
+                        failure_reason,
+                        recommendation_rank
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        scan_id,
+                        values["sport"],
+                        values["market_type"],
+                        values["game_date"],
+                        values["team"],
+                        values["opponent"],
+                        values["event_ticker"],
+                        values["ticker"],
+                        values["side"],
+                        values["economic_exposure_key"],
+                        values["model_version"],
+                        values["fair_probability"],
+                        values["bid_price"],
+                        values["ask_price"],
+                        values["last_price"],
+                        values["recommended_position_dollars"],
+                        values["recommended_contracts"],
+                        values["weighted_fill_price"],
+                        values["gross_contract_cost"],
+                        values["estimated_fee"],
+                        values["all_in_cost"],
+                        values["all_in_cost_per_contract"],
+                        values["gross_edge"],
+                        values["net_edge"],
+                        values["net_roi"],
+                        values["expected_profit"],
+                        values["spread_dollars"],
+                        values["slippage_dollars"],
+                        values["liquidity_coverage"],
+                        values["full_fill"],
+                        values["decision"],
+                        values["failure_reason"],
+                        values["recommendation_rank"],
+                    ),
+                )
+                recommendation_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    INSERT INTO market_snapshots (
+                        recommendation_id,
+                        snapshot_type,
+                        bid_price,
+                        ask_price,
+                        last_price,
+                        volume,
+                        volume_24h,
+                        open_interest
+                    )
+                    VALUES (%s, 'ENTRY', %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        recommendation_id,
+                        values["bid_price"],
+                        values["ask_price"],
+                        values["last_price"],
+                        values["volume"],
+                        values["volume_24h"],
+                        values["open_interest"],
+                    ),
+                )
+
+                persisted.append({
+                    "recommendation_id": recommendation_id,
+                    "ticker": values["ticker"],
+                    "decision": values["decision"],
+                })
+
+            buy_count = sum(
+                1 for item in persisted
+                if item["decision"] in {"BUY YES", "BUY NO"}
+            )
+            pass_count = sum(
+                1 for item in persisted
+                if item["decision"] == "PASS"
+            )
+
+            cur.execute(
+                """
+                UPDATE scans
+                SET markets_discovered = %s,
+                    markets_analyzed = %s,
+                    buy_recommendations = %s,
+                    pass_recommendations = %s,
+                    status = 'COMPLETED',
+                    completed_at = NOW(),
+                    error_message = NULL
+                WHERE id = %s
+                """,
+                (
+                    len(winner_candidates),
+                    len(winner_candidates),
+                    buy_count,
+                    pass_count,
+                    scan_id,
+                ),
+            )
+
+        conn.commit()
+
+    return persisted
+
+
+def latest_scan_payload():
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    scan_uuid,
+                    sport,
+                    market_type,
+                    scan_date,
+                    model_version,
+                    home_field_elo,
+                    elo_scale,
+                    markets_discovered,
+                    markets_analyzed,
+                    buy_recommendations,
+                    pass_recommendations,
+                    status,
+                    error_message,
+                    started_at,
+                    completed_at
+                FROM scans
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            scan_row = cur.fetchone()
+
+            if not scan_row:
+                return None
+
+            scan_id = scan_row[0]
+
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    ticker,
+                    side,
+                    decision,
+                    fair_probability,
+                    ask_price,
+                    net_edge,
+                    net_roi,
+                    recommended_position_dollars,
+                    recommended_contracts,
+                    created_at
+                FROM recommendations
+                WHERE scan_id = %s
+                ORDER BY recommendation_rank NULLS LAST, id
+                """,
+                (scan_id,),
+            )
+            recommendation_rows = cur.fetchall()
+
+    return {
+        "scan": {
+            "id": scan_row[0],
+            "scan_uuid": str(scan_row[1]),
+            "sport": scan_row[2],
+            "market_type": scan_row[3],
+            "scan_date": scan_row[4].isoformat() if scan_row[4] else None,
+            "model_version": scan_row[5],
+            "home_field_elo": float(scan_row[6]) if scan_row[6] is not None else None,
+            "elo_scale": float(scan_row[7]) if scan_row[7] is not None else None,
+            "markets_discovered": scan_row[8],
+            "markets_analyzed": scan_row[9],
+            "buy_recommendations": scan_row[10],
+            "pass_recommendations": scan_row[11],
+            "status": scan_row[12],
+            "error_message": scan_row[13],
+            "started_at": scan_row[14].isoformat() if scan_row[14] else None,
+            "completed_at": scan_row[15].isoformat() if scan_row[15] else None,
+        },
+        "recommendations": [
+            {
+                "id": row[0],
+                "ticker": row[1],
+                "side": row[2],
+                "decision": row[3],
+                "fair_probability": float(row[4]) if row[4] is not None else None,
+                "ask_price": float(row[5]) if row[5] is not None else None,
+                "net_edge": float(row[6]) if row[6] is not None else None,
+                "net_roi": float(row[7]) if row[7] is not None else None,
+                "recommended_position_dollars": float(row[8]) if row[8] is not None else None,
+                "recommended_contracts": float(row[9]) if row[9] is not None else None,
+                "created_at": row[10].isoformat() if row[10] else None,
+            }
+            for row in recommendation_rows
+        ],
+        "recommendation_count": len(recommendation_rows),
+    }
 
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -4041,6 +4626,175 @@ def analyze():
         return jsonify(
             error=str(e)
         ), 502
+
+
+@app.get("/scan-matchup")
+def scan_matchup():
+    """
+    Run one real college-football winner-market analysis and persist
+    the scan, recommendation rows, and ENTRY market snapshots.
+
+    This endpoint is analytics-only. It cannot place a Kalshi trade.
+    """
+    team = request.args.get("team", "").strip()
+    opponent = request.args.get("opponent", "").strip()
+    game_date = request.args.get("date", "").strip()
+    max_position_text = request.args.get(
+        "max_position_dollars",
+        str(EXECUTION_DEFAULT_MAX_POSITION_DOLLARS),
+    ).strip()
+
+    valid, message = validate_values(team, opponent, game_date)
+    if not valid:
+        return jsonify(success=False, error=message), 400
+
+    try:
+        max_position_dollars = float(max_position_text)
+    except ValueError:
+        return jsonify(
+            success=False,
+            error="max_position_dollars must be a number greater than 0 and no more than 10000.",
+        ), 400
+
+    if max_position_dollars <= 0 or max_position_dollars > 10000:
+        return jsonify(
+            success=False,
+            error="max_position_dollars must be greater than 0 and no more than 10000.",
+        ), 400
+
+    scan_record = None
+
+    try:
+        scan_record = create_scan_record(
+            game_date,
+            max_position_dollars,
+        )
+
+        data = build_game_data(team, opponent, game_date)
+
+        if not data["game_event"]:
+            mark_scan_failed(
+                scan_record["scan_id"],
+                "No matching Kalshi college football event found.",
+            )
+            return jsonify(
+                success=False,
+                persisted_scan_id=scan_record["scan_id"],
+                persisted_scan_uuid=scan_record["scan_uuid"],
+                found=False,
+                matchup=f"{team} vs {opponent}",
+                date=game_date,
+                message="No matching Kalshi college football event found.",
+            ), 404
+
+        probability_model = build_probability_model(
+            team,
+            opponent,
+            game_date,
+        )
+
+        winner_probabilities = find_winner_fair_probabilities(
+            data["game_winner"],
+            team,
+            opponent,
+            probability_model,
+        )
+
+        winner_candidates = analysis_candidates(
+            data["game_winner"],
+            "winner",
+            winner_probabilities,
+            max_position_dollars=max_position_dollars,
+        )
+
+        trade_decision = choose_matchup_trade_decision(
+            winner_candidates
+        )
+
+        persisted = persist_scan_results(
+            scan_record["scan_id"],
+            team,
+            opponent,
+            game_date,
+            data["game_event"],
+            probability_model,
+            winner_candidates,
+            trade_decision,
+        )
+
+        return jsonify(
+            success=True,
+            read_only_kalshi=True,
+            persistence_verified_by_insert=True,
+            scan={
+                "id": scan_record["scan_id"],
+                "scan_uuid": scan_record["scan_uuid"],
+                "status": "COMPLETED",
+                "recommendations_saved": len(persisted),
+            },
+            matchup=f"{team} vs {opponent}",
+            date=game_date,
+            event_ticker=data["game_event"],
+            model_version=probability_model.get("model_version"),
+            live_home_field_elo=LIVE_HOME_FIELD_ELO,
+            live_elo_scale=LIVE_ELO_SCALE,
+            trade_decision=trade_decision,
+            persisted_recommendations=persisted,
+        )
+
+    except RuntimeError as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(
+            success=False,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+    except requests.RequestException as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(
+            success=False,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 502
+
+    except Exception as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(
+            success=False,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+
+@app.get("/db/latest-scan")
+def db_latest_scan():
+    """Read-only verification of the newest persisted scanner run."""
+    try:
+        payload = latest_scan_payload()
+
+        if payload is None:
+            return jsonify(
+                success=True,
+                found=False,
+                message="No persisted scans exist yet.",
+            )
+
+        return jsonify(
+            success=True,
+            found=True,
+            **payload,
+        )
+
+    except Exception as e:
+        return jsonify(
+            success=False,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
 
 
 @app.get("/smu-today")
