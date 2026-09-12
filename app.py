@@ -2,19 +2,153 @@ from flask import Flask, jsonify, request
 import os
 import math
 import requests
+import psycopg
+from pathlib import Path
 from datetime import datetime
 from difflib import SequenceMatcher
 from decimal import Decimal, ROUND_CEILING
 
 app = Flask(__name__)
 
+# ============================================================
+# POSTGRESQL DATABASE / SCHEMA VERIFICATION
+#
+# This layer is intentionally isolated from the Kalshi, CFBD,
+# probability-model, calibration, execution, and decision logic.
+# It uses only the DATABASE_URL environment variable already
+# configured in Render and a fixed local migration file.
+# ============================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_MIGRATION_FILE = "001_initial_schema.sql"
+EXPECTED_DB_TABLES = (
+    "settings",
+    "scans",
+    "recommendations",
+    "positions",
+    "market_snapshots",
+)
+
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return psycopg.connect(DATABASE_URL)
+
+
+def database_table_status(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = ANY(%s)
+            ORDER BY table_name
+            """,
+            (list(EXPECTED_DB_TABLES),),
+        )
+        existing = [row[0] for row in cur.fetchall()]
+
+    missing = [
+        table_name
+        for table_name in EXPECTED_DB_TABLES
+        if table_name not in existing
+    ]
+
+    return {
+        "expected_tables": list(EXPECTED_DB_TABLES),
+        "existing_tables": existing,
+        "missing_tables": missing,
+        "all_tables_present": not missing,
+    }
+
+
+@app.get("/db/health")
+def db_health():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                connection_test = cur.fetchone()[0]
+            table_status = database_table_status(conn)
+
+        return jsonify(
+            success=True,
+            database="connected",
+            connection_test=connection_test,
+            **table_status,
+        )
+
+    except Exception as e:
+        return jsonify(
+            success=False,
+            database="error",
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+
+@app.get("/db/migrate")
+def db_migrate():
+    """
+    Run the repository's fixed initial schema migration, then verify
+    that all five required V1 tables exist. No caller-supplied SQL is
+    accepted, and database credentials are never returned.
+    """
+    try:
+        schema_path = Path(__file__).resolve().with_name(
+            DATABASE_MIGRATION_FILE
+        )
+
+        if not schema_path.exists():
+            return jsonify(
+                success=False,
+                migration="error",
+                error=f"{DATABASE_MIGRATION_FILE} was not found",
+            ), 500
+
+        schema_sql = schema_path.read_text(encoding="utf-8")
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(schema_sql, prepare=False)
+            conn.commit()
+            table_status = database_table_status(conn)
+
+        status_code = 200 if table_status["all_tables_present"] else 500
+
+        return jsonify(
+            success=table_status["all_tables_present"],
+            migration=(
+                "complete"
+                if table_status["all_tables_present"]
+                else "incomplete"
+            ),
+            migration_file=DATABASE_MIGRATION_FILE,
+            **table_status,
+        ), status_code
+
+    except Exception as e:
+        return jsonify(
+            success=False,
+            migration="error",
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 CFBD_BASE = "https://api.collegefootballdata.com"
 CFBD_API_KEY = os.environ.get("CFBD_API_KEY", "").strip()
 
-# Calibrated from 3,611 completed, non-neutral,
-# FBS-vs-FBS regular-season games from 2021-2025.
+# Historical single-parameter calibration benchmark from 3,611 completed,
+# non-neutral FBS-vs-FBS regular-season games from 2021-2025.
 CALIBRATED_HOME_FIELD_ELO = 67.0
+
+# Live Elo curve promoted after walk-forward validation on unseen 2024 and 2025 seasons.
+LIVE_HOME_FIELD_ELO = 80.0
+LIVE_ELO_SCALE = 546.0
 
 # ============================================================
 # EXECUTION-LAYER CONFIGURATION
@@ -81,6 +215,8 @@ def home():
         message="Kalshi bridge is running",
         cfbd_configured=bool(CFBD_API_KEY),
         calibrated_home_field_elo=CALIBRATED_HOME_FIELD_ELO,
+        live_home_field_elo=LIVE_HOME_FIELD_ELO,
+        live_elo_scale=LIVE_ELO_SCALE,
         execution_layer={
             "enabled": True,
             "default_contracts": EXECUTION_DEFAULT_CONTRACTS,
@@ -2332,7 +2468,8 @@ def build_cfbd_game_context(
 # ============================================================
 
 def elo_probability(
-    rating_difference
+    rating_difference,
+    scale=400.0
 ):
     return (
         1.0
@@ -2342,7 +2479,7 @@ def elo_probability(
             + math.pow(
                 10.0,
                 -rating_difference
-                / 400.0
+                / scale
             )
         )
     )
@@ -2429,22 +2566,22 @@ def build_probability_model(
 
     elif team_home_away == "home":
         home_field_adjustment = (
-            CALIBRATED_HOME_FIELD_ELO
+            LIVE_HOME_FIELD_ELO
         )
 
         location_reason = (
             "Selected team is home: "
-            "+67 Elo applied."
+            "+80 Elo applied."
         )
 
     elif team_home_away == "away":
         home_field_adjustment = (
-            -CALIBRATED_HOME_FIELD_ELO
+            -LIVE_HOME_FIELD_ELO
         )
 
         location_reason = (
             "Selected team is away: "
-            "-67 Elo applied from the "
+            "-80 Elo applied from the "
             "selected team's perspective."
         )
 
@@ -2463,7 +2600,8 @@ def build_probability_model(
 
     team_probability = (
         elo_probability(
-            adjusted_rating_difference
+            adjusted_rating_difference,
+            LIVE_ELO_SCALE
         )
     )
 
@@ -2479,7 +2617,7 @@ def build_probability_model(
             "CFBD pregame Elo + calibrated home field",
 
         "model_version":
-            "cfbd-pregame-elo-hfa-v3",
+            "cfbd-pregame-elo-hfa-v4-walk-forward",
 
         "game_context":
             context,
@@ -2497,7 +2635,10 @@ def build_probability_model(
             ),
 
         "calibrated_home_field_elo":
-            CALIBRATED_HOME_FIELD_ELO,
+            LIVE_HOME_FIELD_ELO,
+
+        "elo_scale":
+            LIVE_ELO_SCALE,
 
         "neutral_site":
             neutral_site,
@@ -3737,23 +3878,24 @@ def analyze():
 
                 "home_field":
                     (
-                        "A +67 Elo home-field "
+                        "A +80 Elo home-field "
                         "adjustment is applied to "
                         "the home team. From the "
                         "selected team's perspective "
-                        "this is +67 when home, "
-                        "-67 when away, and 0 on "
+                        "this is +80 when home, "
+                        "-80 when away, and 0 on "
                         "neutral sites."
                     ),
 
                 "home_field_calibration":
                     (
-                        "67 Elo points was fitted "
-                        "on 3,611 completed "
-                        "non-neutral FBS-vs-FBS "
-                        "regular-season games from "
-                        "2021-2025 by minimizing "
-                        "binary log loss."
+                        "The live curve uses an 80-point "
+                        "home-field adjustment and a 546 "
+                        "Elo scale after walk-forward "
+                        "validation on unseen 2024 and "
+                        "2025 seasons. The earlier 67-point "
+                        "single-parameter calibration is "
+                        "retained only as a benchmark."
                     ),
 
                 "kalshi_role":
