@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
 from decimal import Decimal, ROUND_CEILING
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -5509,32 +5510,46 @@ def scan_board():
             },
         )
 
+        # Analyze independent games concurrently. Each event needs its own
+        # Kalshi market/order-book reads, and doing those serially can exceed
+        # Gunicorn's request timeout on a full Saturday board even after CFBD
+        # matching has been optimized. The shared CFBD season list is read-only.
+        # Keep the worker pool modest so we reduce wall-clock time without
+        # creating an unnecessarily aggressive burst against Kalshi.
         board_games = []
-        for event in events:
-            try:
-                board_games.append(
-                    analyze_board_event(
-                        event,
-                        game_date,
-                        settings["max_position_dollars"],
-                        preloaded_cfbd_games=cfbd_games,
+        max_workers = min(8, max(1, len(events)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_event = {
+                executor.submit(
+                    analyze_board_event,
+                    event,
+                    game_date,
+                    settings["max_position_dollars"],
+                    cfbd_games,
+                ): event
+                for event in events
+            }
+
+            for future in as_completed(future_to_event):
+                event = future_to_event[future]
+                try:
+                    board_games.append(future.result())
+                except Exception as e:
+                    # One bad event must not abort the rest of the board.
+                    board_games.append(
+                        {
+                            "event_ticker": event.get("event_ticker"),
+                            "title": event.get("title"),
+                            "team": None,
+                            "opponent": None,
+                            "winner_market_count": 0,
+                            "analyzed": False,
+                            "error": f"{type(e).__name__}: {e}",
+                            "winner_candidates": [],
+                            "trade_decision": {"action": "PASS", "reason": "Event analysis failed."},
+                        }
                     )
-                )
-            except (RuntimeError, requests.RequestException, Exception) as e:
-                # One bad event must not abort the rest of the board.
-                board_games.append(
-                    {
-                        "event_ticker": event.get("event_ticker"),
-                        "title": event.get("title"),
-                        "team": None,
-                        "opponent": None,
-                        "winner_market_count": 0,
-                        "analyzed": False,
-                        "error": f"{type(e).__name__}: {e}",
-                        "winner_candidates": [],
-                        "trade_decision": {"action": "PASS", "reason": "Event analysis failed."},
-                    }
-                )
 
         allocation = allocate_board_portfolio(
             board_games,
