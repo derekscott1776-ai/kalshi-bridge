@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 import os
 import math
+import re
 import requests
 import psycopg
 import uuid
@@ -357,14 +358,31 @@ def recommendation_values(
 
         execution = market.get("execution_analysis") or {}
         side_metrics = execution.get(str(side).lower()) or {}
-        gross_cost = number(
-            side_metrics.get("gross_contract_cost_dollars")
+
+        # Persist metrics for the ACTUALLY approved tier.  The market-level
+        # side_metrics object can represent the original maximum-position
+        # sizing even when the decision engine approved a smaller tier.
+        # Deriving these fields from the selected decision keeps database
+        # history consistent with the recommendation that was actually made.
+        gross_cost = (
+            all_in_cost - estimated_fee
+            if all_in_cost is not None and estimated_fee is not None
+            else number(side_metrics.get("gross_contract_cost_dollars"))
         )
-        all_in_per_contract = number(
-            side_metrics.get("all_in_cost_per_contract")
+        all_in_per_contract = (
+            all_in_cost / contracts
+            if all_in_cost is not None and contracts is not None and contracts > 0
+            else number(side_metrics.get("all_in_cost_per_contract"))
         )
-        expected_profit = number(
-            side_metrics.get("expected_profit_for_position")
+        expected_profit = (
+            (fair_probability * contracts) - all_in_cost
+            if (
+                fair_probability is not None
+                and contracts is not None
+                and contracts > 0
+                and all_in_cost is not None
+            )
+            else number(side_metrics.get("expected_profit_for_position"))
         )
         best_ask = number(side_metrics.get("best_ask"))
         gross_edge = (
@@ -372,9 +390,7 @@ def recommendation_values(
             if fair_probability is not None and best_ask is not None
             else None
         )
-        full_fill = bool(
-            side_metrics.get("orderbook_walk", {}).get("full_fill")
-        )
+        full_fill = True
     else:
         approved_tier = None
         contracts = None
@@ -4848,6 +4864,726 @@ def smu_today():
         return jsonify(
             error=str(e)
         ), 502
+
+# ============================================================
+# MILESTONE 3: FULL-BOARD CFB WINNER SCANNER
+#
+# Discovers every Kalshi KXNCAAFGAME event for a requested date,
+# prices each matchup with the live 80 / 546 Elo model, evaluates
+# executable YES/NO prices, applies the database-configured risk
+# budget, persists the complete board, and returns ranked BUY/PASS
+# results. Kalshi access remains read-only.
+# ============================================================
+
+
+def scanner_settings():
+    """Load portfolio controls from PostgreSQL for every board scan."""
+    with get_db_connection() as conn:
+        return {
+            "bankroll_dollars": db_numeric_setting(
+                conn, "bankroll_dollars", DEFAULT_BANKROLL_DOLLARS
+            ),
+            "max_position_dollars": db_numeric_setting(
+                conn,
+                "max_position_dollars",
+                EXECUTION_DEFAULT_MAX_POSITION_DOLLARS,
+            ),
+            "max_open_risk_dollars": db_numeric_setting(
+                conn,
+                "max_open_risk_dollars",
+                DEFAULT_MAX_OPEN_RISK_DOLLARS,
+            ),
+        }
+
+
+def create_board_scan_record(game_date, settings):
+    scan_uuid = uuid.uuid4()
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scans (
+                    scan_uuid, sport, market_type, scan_date,
+                    model_version, home_field_elo, elo_scale,
+                    bankroll_dollars, max_position_dollars,
+                    max_open_risk_dollars, status
+                )
+                VALUES (
+                    %s, 'college_football', 'winner', %s, %s,
+                    %s, %s, %s, %s, %s, 'RUNNING'
+                )
+                RETURNING id
+                """,
+                (
+                    scan_uuid,
+                    game_date,
+                    LIVE_MODEL_VERSION,
+                    LIVE_HOME_FIELD_ELO,
+                    LIVE_ELO_SCALE,
+                    settings["bankroll_dollars"],
+                    settings["max_position_dollars"],
+                    settings["max_open_risk_dollars"],
+                ),
+            )
+            scan_id = cur.fetchone()[0]
+        conn.commit()
+
+    return {"scan_id": scan_id, "scan_uuid": str(scan_uuid)}
+
+
+def discover_cfb_events_for_date(game_date):
+    """Return all KXNCAAFGAME events whose ticker contains the date code."""
+    date_obj = datetime.strptime(game_date, "%Y-%m-%d")
+    date_code = date_obj.strftime("%y%b%d").upper()
+    cursor = None
+    events = []
+    seen = set()
+
+    for _ in range(30):
+        params = {"series_ticker": "KXNCAAFGAME", "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+
+        data = kalshi_get("/events", params=params)
+        for event in data.get("events", []):
+            ticker = str(event.get("event_ticker") or "").upper()
+            if date_code not in ticker or ticker in seen:
+                continue
+            seen.add(ticker)
+            events.append(event)
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+    events.sort(key=lambda event: str(event.get("event_ticker") or ""))
+    return events
+
+
+def clean_outcome_team_name(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    # Remove common outcome wording without damaging school names.
+    patterns = [
+        r"^will\s+",
+        r"\s+win(?:\s+the\s+game)?\??$",
+        r"\s+to\s+win(?:\s+the\s+game)?\??$",
+        r"\s+wins(?:\s+the\s+game)?\??$",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+    return text or None
+
+
+def event_title_team_pair(event):
+    """Best-effort fallback parser for ordinary 'Team A vs Team B' titles."""
+    title = str(event.get("title") or event.get("sub_title") or "").strip()
+    if not title:
+        return None
+
+    # Strip leading question wording when present.
+    title = re.sub(r"^will\s+", "", title, flags=re.IGNORECASE).strip()
+
+    separators = [r"\s+vs\.?\s+", r"\s+v\.\s+", r"\s+at\s+"]
+    for separator in separators:
+        parts = re.split(separator, title, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) != 2:
+            continue
+
+        left = clean_outcome_team_name(parts[0])
+        right = clean_outcome_team_name(parts[1])
+        if left and right and normalize(left) != normalize(right):
+            return left, right
+
+    return None
+
+
+def infer_event_teams(event, markets):
+    """
+    Infer the two schools represented by a winner event.
+
+    Outcome-specific YES subtitles are preferred because the generic event
+    title can contain both teams. The event title is only a fallback.
+    """
+    labels = []
+
+    for market in markets or []:
+        candidates = [
+            market.get("yes_sub_title"),
+            market.get("yes_subtitle"),
+            market.get("subtitle"),
+            market.get("sub_title"),
+        ]
+        for candidate in candidates:
+            cleaned = clean_outcome_team_name(candidate)
+            if not cleaned:
+                continue
+            if any(normalize(cleaned) == normalize(existing) for existing in labels):
+                continue
+            labels.append(cleaned)
+            break
+
+    if len(labels) >= 2:
+        # With normal two-contract winner events the first two distinct
+        # outcome labels are the two teams. Extra labels are ignored.
+        return labels[0], labels[1], "winner_contract_outcome_labels"
+
+    fallback = event_title_team_pair(event)
+    if fallback:
+        return fallback[0], fallback[1], "event_title"
+
+    return None, None, "unresolved"
+
+
+def compact_cfb_line_event(event, markets):
+    team, opponent, identity_source = infer_event_teams(event, markets)
+    return {
+        "event_ticker": event.get("event_ticker"),
+        "title": event.get("title"),
+        "team": team,
+        "opponent": opponent,
+        "identity_source": identity_source,
+        "markets": [compact_market(market) for market in markets],
+    }
+
+
+def analyze_board_event(event, game_date, max_position_dollars):
+    event_ticker = event.get("event_ticker")
+    markets = get_event_markets(event_ticker)
+    team, opponent, identity_source = infer_event_teams(event, markets)
+
+    base = {
+        "event_ticker": event_ticker,
+        "title": event.get("title"),
+        "team": team,
+        "opponent": opponent,
+        "identity_source": identity_source,
+        "winner_market_count": len(markets),
+    }
+
+    if not team or not opponent:
+        return {
+            **base,
+            "analyzed": False,
+            "error": "Could not identify both teams from the Kalshi winner event.",
+            "winner_candidates": [],
+            "trade_decision": {"action": "PASS", "reason": "Team identity unresolved."},
+        }
+
+    probability_model = build_probability_model(team, opponent, game_date)
+    if not probability_model.get("available"):
+        return {
+            **base,
+            "analyzed": False,
+            "probability_model": probability_model,
+            "error": probability_model.get("reason") or "Independent probability unavailable.",
+            "winner_candidates": [],
+            "trade_decision": {"action": "PASS", "reason": "Independent probability unavailable."},
+        }
+
+    winner_probabilities = find_winner_fair_probabilities(
+        markets, team, opponent, probability_model
+    )
+    winner_candidates = analysis_candidates(
+        markets,
+        "winner",
+        winner_probabilities,
+        max_position_dollars=max_position_dollars,
+    )
+    trade_decision = choose_matchup_trade_decision(winner_candidates)
+
+    return {
+        **base,
+        "analyzed": True,
+        "probability_model": probability_model,
+        "winner_probabilities_mapped": len(winner_probabilities),
+        "winner_candidates": winner_candidates,
+        "trade_decision": trade_decision,
+    }
+
+
+def decision_sort_key(board_game):
+    decision = board_game.get("trade_decision") or {}
+    return (
+        number(decision.get("net_edge")) or -999,
+        number(decision.get("net_roi")) or -999,
+        number(decision.get("liquidity_coverage_ratio")) or -999,
+        -(number(decision.get("slippage_dollars")) or 999),
+    )
+
+
+def resize_qualifying_decision(board_game, remaining_risk):
+    """
+    If the independently approved tier exceeds remaining portfolio risk,
+    search the selected side's already-computed lower-tier attempts and use
+    the largest passing tier that fits. No new probability estimate is made.
+    """
+    decision = board_game.get("trade_decision") or {}
+    action = str(decision.get("action") or "PASS")
+    ticker = decision.get("ticker")
+    side = decision.get("side")
+
+    if action not in {"BUY YES", "BUY NO"} or not ticker or side not in {"YES", "NO"}:
+        return None
+
+    approved = number(decision.get("approved_tier_dollars")) or 0.0
+    if approved <= remaining_risk + 1e-9:
+        return dict(decision)
+
+    selected_market = next(
+        (
+            market for market in board_game.get("winner_candidates", [])
+            if market.get("ticker") == ticker
+        ),
+        None,
+    )
+    if not selected_market:
+        return None
+
+    engine = ((selected_market.get("execution_analysis") or {}).get("decision_engine") or {})
+    side_decision = engine.get(side.lower()) or {}
+
+    passing_attempts = [
+        attempt
+        for attempt in side_decision.get("attempts", [])
+        if attempt.get("passed")
+        and (number(attempt.get("tier_dollars")) or 0.0) <= remaining_risk + 1e-9
+    ]
+    if not passing_attempts:
+        return None
+
+    attempt = max(passing_attempts, key=lambda item: number(item.get("tier_dollars")) or 0.0)
+    execution = attempt.get("execution") or {}
+
+    return {
+        "ticker": ticker,
+        "title": selected_market.get("title"),
+        "action": f"BUY {side}",
+        "side": side,
+        "approved_tier_dollars": number(attempt.get("tier_dollars")),
+        "contracts": attempt.get("final_contracts"),
+        "all_in_total_cost_dollars": attempt.get("all_in_total_cost_dollars"),
+        "net_edge": attempt.get("net_edge"),
+        "net_edge_percentage_points": attempt.get("net_edge_percentage_points"),
+        "net_roi": attempt.get("net_roi"),
+        "net_roi_percent": attempt.get("net_roi_percent"),
+        "spread_dollars": attempt.get("spread_dollars"),
+        "slippage_dollars": attempt.get("slippage_dollars"),
+        "liquidity_coverage_ratio": (attempt.get("liquidity") or {}).get("coverage_ratio"),
+        "liquidity_coverage_percent": (attempt.get("liquidity") or {}).get("coverage_percent"),
+        "fee_dollars": execution.get("total_fee_dollars"),
+        "weighted_average_fill_price": execution.get("weighted_average_fill_price"),
+        "portfolio_resized": True,
+        "thresholds": decision.get("thresholds"),
+    }
+
+
+def allocate_board_portfolio(board_games, max_open_risk_dollars):
+    """Rank independent BUYs, then allocate the configurable total risk budget."""
+    qualifiers = [
+        game
+        for game in board_games
+        if str((game.get("trade_decision") or {}).get("action", "")).startswith("BUY ")
+    ]
+    qualifiers.sort(key=decision_sort_key, reverse=True)
+
+    remaining = max(0.0, number(max_open_risk_dollars) or 0.0)
+    allocated = 0.0
+    selected_by_event = {}
+
+    for game in qualifiers:
+        final_decision = resize_qualifying_decision(game, remaining)
+        event_ticker = game.get("event_ticker")
+
+        if final_decision is None:
+            selected_by_event[event_ticker] = {
+                "action": "PASS",
+                "reason": "Qualified independently, but the remaining portfolio risk budget could not support a passing tier.",
+                "portfolio_capacity_blocked": True,
+                "independent_decision": game.get("trade_decision"),
+            }
+            continue
+
+        cost = number(final_decision.get("all_in_total_cost_dollars"))
+        if cost is None:
+            cost = number(final_decision.get("approved_tier_dollars")) or 0.0
+
+        # Reserve actual simulated all-in cost, never more than the approved tier.
+        risk_used = min(
+            number(final_decision.get("approved_tier_dollars")) or cost,
+            cost,
+        )
+        risk_used = max(0.0, risk_used)
+
+        if risk_used > remaining + 1e-9:
+            selected_by_event[event_ticker] = {
+                "action": "PASS",
+                "reason": "Qualified independently, but exceeded the remaining portfolio risk budget.",
+                "portfolio_capacity_blocked": True,
+                "independent_decision": game.get("trade_decision"),
+            }
+            continue
+
+        final_decision["portfolio_risk_allocated_dollars"] = round(risk_used, 4)
+        selected_by_event[event_ticker] = final_decision
+        allocated += risk_used
+        remaining -= risk_used
+
+    # Games that never independently qualified remain PASS.
+    for game in board_games:
+        event_ticker = game.get("event_ticker")
+        if event_ticker not in selected_by_event:
+            selected_by_event[event_ticker] = game.get("trade_decision") or {
+                "action": "PASS",
+                "reason": "No qualifying trade.",
+            }
+
+    return {
+        "max_open_risk_dollars": round(number(max_open_risk_dollars) or 0.0, 2),
+        "allocated_risk_dollars": round(allocated, 4),
+        "remaining_risk_dollars": round(max(0.0, remaining), 4),
+        "selected_by_event": selected_by_event,
+    }
+
+
+def insert_recommendation_row(cur, scan_id, values):
+    cur.execute(
+        """
+        INSERT INTO recommendations (
+            scan_id, sport, market_type, game_date, team, opponent,
+            event_ticker, ticker, side, economic_exposure_key,
+            model_version, fair_probability, bid_price, ask_price,
+            last_price, recommended_position_dollars,
+            recommended_contracts, weighted_fill_price,
+            gross_contract_cost, estimated_fee, all_in_cost,
+            all_in_cost_per_contract, gross_edge, net_edge, net_roi,
+            expected_profit, spread_dollars, slippage_dollars,
+            liquidity_coverage, full_fill, decision, failure_reason,
+            recommendation_rank
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            scan_id, values["sport"], values["market_type"], values["game_date"],
+            values["team"], values["opponent"], values["event_ticker"], values["ticker"],
+            values["side"], values["economic_exposure_key"], values["model_version"],
+            values["fair_probability"], values["bid_price"], values["ask_price"],
+            values["last_price"], values["recommended_position_dollars"],
+            values["recommended_contracts"], values["weighted_fill_price"],
+            values["gross_contract_cost"], values["estimated_fee"], values["all_in_cost"],
+            values["all_in_cost_per_contract"], values["gross_edge"], values["net_edge"],
+            values["net_roi"], values["expected_profit"], values["spread_dollars"],
+            values["slippage_dollars"], values["liquidity_coverage"], values["full_fill"],
+            values["decision"], values["failure_reason"], values["recommendation_rank"],
+        ),
+    )
+    return cur.fetchone()[0]
+
+
+def persist_board_scan_results(scan_id, game_date, board_games, allocation):
+    """Persist every analyzed winner contract from one full-board scan."""
+    persisted = []
+    global_rank = 1
+    analyzed_markets = 0
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            for game in board_games:
+                winner_candidates = game.get("winner_candidates") or []
+                if not winner_candidates:
+                    continue
+
+                probability_model = game.get("probability_model") or {}
+                final_decision = allocation["selected_by_event"].get(
+                    game.get("event_ticker"),
+                    game.get("trade_decision") or {"action": "PASS"},
+                )
+
+                for market in winner_candidates:
+                    values = recommendation_values(
+                        market,
+                        game.get("team"),
+                        game.get("opponent"),
+                        game_date,
+                        game.get("event_ticker"),
+                        probability_model,
+                        final_decision,
+                        global_rank,
+                    )
+
+                    # Make portfolio-cap PASS reasons explicit in persisted history.
+                    if (
+                        values["decision"] == "PASS"
+                        and final_decision.get("portfolio_capacity_blocked")
+                    ):
+                        values["failure_reason"] = final_decision.get("reason")
+
+                    recommendation_id = insert_recommendation_row(cur, scan_id, values)
+                    cur.execute(
+                        """
+                        INSERT INTO market_snapshots (
+                            recommendation_id, snapshot_type, bid_price,
+                            ask_price, last_price, volume, volume_24h,
+                            open_interest
+                        )
+                        VALUES (%s, 'ENTRY', %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            recommendation_id,
+                            values["bid_price"],
+                            values["ask_price"],
+                            values["last_price"],
+                            values["volume"],
+                            values["volume_24h"],
+                            values["open_interest"],
+                        ),
+                    )
+                    persisted.append(
+                        {
+                            "recommendation_id": recommendation_id,
+                            "event_ticker": game.get("event_ticker"),
+                            "ticker": values["ticker"],
+                            "decision": values["decision"],
+                        }
+                    )
+                    analyzed_markets += 1
+                    global_rank += 1
+
+            buy_count = sum(
+                1 for item in persisted if item["decision"] in {"BUY YES", "BUY NO"}
+            )
+            pass_count = sum(1 for item in persisted if item["decision"] == "PASS")
+            discovered_markets = sum(
+                int(game.get("winner_market_count") or 0) for game in board_games
+            )
+
+            cur.execute(
+                """
+                UPDATE scans
+                SET markets_discovered = %s,
+                    markets_analyzed = %s,
+                    buy_recommendations = %s,
+                    pass_recommendations = %s,
+                    status = 'COMPLETED',
+                    completed_at = NOW(),
+                    error_message = NULL
+                WHERE id = %s
+                """,
+                (discovered_markets, analyzed_markets, buy_count, pass_count, scan_id),
+            )
+        conn.commit()
+
+    return persisted
+
+
+def public_board_game(game, final_decision):
+    """Compact response used by /scan-board so the board is easy to consume."""
+    probability_model = game.get("probability_model") or {}
+    decision = final_decision or {"action": "PASS"}
+
+    return {
+        "event_ticker": game.get("event_ticker"),
+        "matchup": (
+            f"{game.get('team')} vs {game.get('opponent')}"
+            if game.get("team") and game.get("opponent")
+            else game.get("title")
+        ),
+        "team": game.get("team"),
+        "opponent": game.get("opponent"),
+        "analyzed": bool(game.get("analyzed")),
+        "error": game.get("error"),
+        "model": {
+            "team_fair_probability": probability_model.get("team_fair_probability"),
+            "opponent_fair_probability": probability_model.get("opponent_fair_probability"),
+            "home_field_elo": LIVE_HOME_FIELD_ELO,
+            "elo_scale": LIVE_ELO_SCALE,
+        },
+        "trade_decision": decision,
+    }
+
+
+@app.get("/cfb-lines")
+def cfb_lines():
+    """Read-only current Kalshi CFB winner board for one date; no DB write."""
+    game_date = request.args.get("date", "").strip()
+    try:
+        datetime.strptime(game_date, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
+
+    try:
+        events = discover_cfb_events_for_date(game_date)
+        board = []
+        for event in events:
+            markets = get_event_markets(event.get("event_ticker"))
+            board.append(compact_cfb_line_event(event, markets))
+
+        return jsonify(
+            success=True,
+            read_only_kalshi=True,
+            date=game_date,
+            event_count=len(board),
+            events=board,
+        )
+    except requests.RequestException as e:
+        return jsonify(success=False, error=str(e)), 502
+
+
+@app.get("/scan-board")
+def scan_board():
+    """
+    Full-board CFB winner scanner for one date.
+
+    Portfolio controls are loaded from PostgreSQL at run time. The endpoint
+    reads Kalshi/CFBD data and writes analytics history only; it never places
+    or modifies an exchange order.
+    """
+    game_date = request.args.get("date", "").strip()
+    try:
+        datetime.strptime(game_date, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
+
+    scan_record = None
+
+    try:
+        settings = scanner_settings()
+        if settings["max_position_dollars"] <= 0:
+            raise RuntimeError("Database setting max_position_dollars must be greater than 0.")
+        if settings["max_open_risk_dollars"] <= 0:
+            raise RuntimeError("Database setting max_open_risk_dollars must be greater than 0.")
+
+        scan_record = create_board_scan_record(game_date, settings)
+        events = discover_cfb_events_for_date(game_date)
+
+        if not events:
+            mark_scan_failed(scan_record["scan_id"], "No Kalshi CFB winner events found for requested date.")
+            return jsonify(
+                success=False,
+                found=False,
+                date=game_date,
+                scan=scan_record,
+                message="No Kalshi CFB winner events found for requested date.",
+            ), 404
+
+        board_games = []
+        for event in events:
+            try:
+                board_games.append(
+                    analyze_board_event(
+                        event,
+                        game_date,
+                        settings["max_position_dollars"],
+                    )
+                )
+            except (RuntimeError, requests.RequestException, Exception) as e:
+                # One bad event must not abort the rest of the board.
+                board_games.append(
+                    {
+                        "event_ticker": event.get("event_ticker"),
+                        "title": event.get("title"),
+                        "team": None,
+                        "opponent": None,
+                        "winner_market_count": 0,
+                        "analyzed": False,
+                        "error": f"{type(e).__name__}: {e}",
+                        "winner_candidates": [],
+                        "trade_decision": {"action": "PASS", "reason": "Event analysis failed."},
+                    }
+                )
+
+        allocation = allocate_board_portfolio(
+            board_games,
+            settings["max_open_risk_dollars"],
+        )
+
+        # Rank final BUYs first by net edge/ROI. PASS games follow.
+        ranked_games = sorted(
+            board_games,
+            key=lambda game: (
+                str(allocation["selected_by_event"].get(game.get("event_ticker"), {}).get("action", "PASS")).startswith("BUY "),
+                decision_sort_key(
+                    {
+                        **game,
+                        "trade_decision": allocation["selected_by_event"].get(
+                            game.get("event_ticker"), game.get("trade_decision")
+                        ),
+                    }
+                ),
+            ),
+            reverse=True,
+        )
+
+        persisted = persist_board_scan_results(
+            scan_record["scan_id"],
+            game_date,
+            ranked_games,
+            allocation,
+        )
+
+        results = [
+            public_board_game(
+                game,
+                allocation["selected_by_event"].get(game.get("event_ticker")),
+            )
+            for game in ranked_games
+        ]
+        buys = [
+            result for result in results
+            if str((result.get("trade_decision") or {}).get("action", "")).startswith("BUY ")
+        ]
+
+        return jsonify(
+            success=True,
+            found=True,
+            read_only_kalshi=True,
+            persistence_verified_by_insert=True,
+            date=game_date,
+            model_version=LIVE_MODEL_VERSION,
+            live_home_field_elo=LIVE_HOME_FIELD_ELO,
+            live_elo_scale=LIVE_ELO_SCALE,
+            settings=settings,
+            portfolio={
+                "max_open_risk_dollars": allocation["max_open_risk_dollars"],
+                "allocated_risk_dollars": allocation["allocated_risk_dollars"],
+                "remaining_risk_dollars": allocation["remaining_risk_dollars"],
+            },
+            scan={
+                "id": scan_record["scan_id"],
+                "scan_uuid": scan_record["scan_uuid"],
+                "status": "COMPLETED",
+                "events_discovered": len(events),
+                "events_analyzed": sum(1 for game in board_games if game.get("analyzed")),
+                "recommendations_saved": len(persisted),
+                "buy_games": len(buys),
+            },
+            ranked_buys=buys,
+            board=results,
+        )
+
+    except RuntimeError as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+    except requests.RequestException as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 502
+    except Exception as e:
+        if scan_record:
+            mark_scan_failed(scan_record["scan_id"], e)
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+
 
 # ============================================================
 # HISTORICAL HOME-FIELD ELO CALIBRATION
