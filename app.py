@@ -2749,7 +2749,8 @@ def game_pair_score(
 def discover_cfbd_game(
     team,
     opponent,
-    game_date
+    game_date,
+    preloaded_games=None
 ):
     requested_date = (
         datetime.strptime(
@@ -2776,37 +2777,43 @@ def discover_cfbd_game(
     seen_ids = set()
     games = []
 
-    for params in searches:
-        data = cfbd_get(
-            "/games",
-            params=params
-        )
-
-        for game in data:
-            game_id = game.get(
-                "id"
+    if preloaded_games is not None:
+        # Board scans preload the season once so we do not make one or two
+        # CFBD HTTP requests per Kalshi event. That serial request pattern can
+        # exceed Gunicorn's request timeout on a full Saturday slate.
+        games = list(preloaded_games)
+    else:
+        for params in searches:
+            data = cfbd_get(
+                "/games",
+                params=params
             )
 
-            if game_id in seen_ids:
-                continue
+            for game in data:
+                game_id = game.get(
+                    "id"
+                )
 
-            seen_ids.add(
-                game_id
+                if game_id in seen_ids:
+                    continue
+
+                seen_ids.add(
+                    game_id
+                )
+
+                games.append(
+                    game
+                )
+
+        # Fallback for a naming mismatch
+        if not games:
+            games = cfbd_get(
+                "/games",
+                params={
+                    "year": year,
+                    "seasonType": "both"
+                }
             )
-
-            games.append(
-                game
-            )
-
-    # Fallback for a naming mismatch
-    if not games:
-        games = cfbd_get(
-            "/games",
-            params={
-                "year": year,
-                "seasonType": "both"
-            }
-        )
 
     candidates = []
 
@@ -2879,12 +2886,14 @@ def discover_cfbd_game(
 def build_cfbd_game_context(
     team,
     opponent,
-    game_date
+    game_date,
+    preloaded_games=None
 ):
     game = discover_cfbd_game(
         team,
         opponent,
-        game_date
+        game_date,
+        preloaded_games=preloaded_games
     )
 
     if not game:
@@ -3089,13 +3098,15 @@ def elo_probability(
 def build_probability_model(
     team,
     opponent,
-    game_date
+    game_date,
+    preloaded_games=None
 ):
     context = (
         build_cfbd_game_context(
             team,
             opponent,
-            game_date
+            game_date,
+            preloaded_games=preloaded_games
         )
     )
 
@@ -5051,7 +5062,7 @@ def compact_cfb_line_event(event, markets):
     }
 
 
-def analyze_board_event(event, game_date, max_position_dollars):
+def analyze_board_event(event, game_date, max_position_dollars, preloaded_cfbd_games=None):
     event_ticker = event.get("event_ticker")
     markets = get_event_markets(event_ticker)
     team, opponent, identity_source = infer_event_teams(event, markets)
@@ -5074,7 +5085,12 @@ def analyze_board_event(event, game_date, max_position_dollars):
             "trade_decision": {"action": "PASS", "reason": "Team identity unresolved."},
         }
 
-    probability_model = build_probability_model(team, opponent, game_date)
+    probability_model = build_probability_model(
+        team,
+        opponent,
+        game_date,
+        preloaded_games=preloaded_cfbd_games,
+    )
     if not probability_model.get("available"):
         return {
             **base,
@@ -5476,6 +5492,17 @@ def scan_board():
                 message="No Kalshi CFB winner events found for requested date.",
             ), 404
 
+        # Fetch the CFBD season only once for the entire board. The previous
+        # implementation called /games separately for every matchup, which
+        # caused Gunicorn to kill the request on large Saturday slates.
+        cfbd_games = cfbd_get(
+            "/games",
+            params={
+                "year": datetime.strptime(game_date, "%Y-%m-%d").year,
+                "seasonType": "both",
+            },
+        )
+
         board_games = []
         for event in events:
             try:
@@ -5484,6 +5511,7 @@ def scan_board():
                         event,
                         game_date,
                         settings["max_position_dollars"],
+                        preloaded_cfbd_games=cfbd_games,
                     )
                 )
             except (RuntimeError, requests.RequestException, Exception) as e:
