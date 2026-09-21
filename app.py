@@ -4951,6 +4951,59 @@ def create_board_scan_record(game_date, settings):
     return {"scan_id": scan_id, "scan_uuid": str(scan_uuid)}
 
 
+
+def discover_cfb_winner_markets_fast(game_date):
+    """
+    Fast read-only CFB winner-market discovery for /cfb-lines.
+
+    Query Kalshi's markets endpoint directly instead of paging through every
+    KXNCAAFGAME event and then making one additional markets request per event.
+    This keeps the ChatGPT-facing endpoint inside the normal web-request
+    timeout while leaving the Milestone 3 background scanner unchanged.
+    """
+    date_obj = datetime.strptime(game_date, "%Y-%m-%d")
+    date_code = date_obj.strftime("%y%b%d").upper()
+    cursor = None
+    markets = []
+    seen = set()
+
+    for _ in range(12):
+        params = {
+            "series_ticker": "KXNCAAFGAME",
+            "limit": 1000,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        data = kalshi_get("/markets", params=params)
+
+        for market in data.get("markets", []):
+            ticker = str(market.get("ticker") or "").upper()
+            event_ticker = str(market.get("event_ticker") or "").upper()
+
+            if date_code not in ticker and date_code not in event_ticker:
+                continue
+
+            if not (
+                ticker.startswith("KXNCAAFGAME-")
+                or event_ticker.startswith("KXNCAAFGAME-")
+            ):
+                continue
+
+            if ticker in seen:
+                continue
+
+            seen.add(ticker)
+            markets.append(market)
+
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+
+    markets.sort(key=lambda market: str(market.get("ticker") or ""))
+    return markets
+
+
 def discover_cfb_events_for_date(game_date):
     """Return all KXNCAAFGAME events whose ticker contains the date code."""
     date_obj = datetime.strptime(game_date, "%Y-%m-%d")
@@ -5477,41 +5530,58 @@ def public_board_game(game, final_decision):
 
 @app.get("/cfb-lines")
 def cfb_lines():
-    """Read-only current Kalshi CFB winner board for one date; no DB write."""
+    """
+    Fast, compact, read-only Kalshi CFB winner board for one date.
+
+    Returns one flat object per winner contract and performs no database write.
+    """
     game_date = request.args.get("date", "").strip()
+
     try:
         datetime.strptime(game_date, "%Y-%m-%d")
     except ValueError:
-        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
+        return jsonify(
+            success=False,
+            error="date must use YYYY-MM-DD format",
+        ), 400
 
     try:
-        events = discover_cfb_events_for_date(game_date)
-        board = []
-        winner_market_count = 0
+        markets = discover_cfb_winner_markets_fast(game_date)
 
-        for event in events:
-            markets = get_event_markets(event.get("event_ticker"))
-            compact_event = compact_cfb_line_event(event, markets)
+        compact_markets = []
+        for market in markets:
+            game = (
+                market.get("title")
+                or market.get("subtitle")
+                or market.get("event_ticker")
+            )
 
-            # Exclude any event that does not actually contain a CFB
-            # game-winner contract. This keeps the Custom GPT response
-            # small and prevents spread/total markets from leaking in.
-            if not compact_event.get("markets"):
-                continue
-
-            winner_market_count += len(compact_event["markets"])
-            board.append(compact_event)
+            compact_markets.append({
+                "game": game,
+                "ticker": market.get("ticker"),
+                "yes_bid": number(market.get("yes_bid_dollars")),
+                "yes_ask": number(market.get("yes_ask_dollars")),
+                "no_bid": number(market.get("no_bid_dollars")),
+                "no_ask": number(market.get("no_ask_dollars")),
+                "last": number(market.get("last_price_dollars")),
+                "volume": number(market.get("volume_fp")),
+                "open_interest": number(market.get("open_interest_fp")),
+            })
 
         return jsonify(
             success=True,
             read_only_kalshi=True,
             date=game_date,
-            event_count=len(board),
-            winner_market_count=winner_market_count,
-            events=board,
+            market_count=len(compact_markets),
+            markets=compact_markets,
         )
+
     except requests.RequestException as e:
-        return jsonify(success=False, error=str(e)), 502
+        return jsonify(
+            success=False,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 502
 
 
 @app.get("/scan-board")
