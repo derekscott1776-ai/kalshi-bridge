@@ -5058,15 +5058,54 @@ def infer_event_teams(event, markets):
     return None, None, "unresolved"
 
 
+def is_cfb_winner_market(market):
+    """Return True only for college-football game-winner contracts."""
+    ticker = str(market.get("ticker") or "").upper()
+    event_ticker = str(market.get("event_ticker") or "").upper()
+    return (
+        ticker.startswith("KXNCAAFGAME-")
+        or event_ticker.startswith("KXNCAAFGAME-")
+    )
+
+
+def compact_cfb_line_market(market):
+    """Small public payload for /cfb-lines and Custom GPT actions."""
+    return {
+        "ticker": market.get("ticker"),
+        "outcome": (
+            market.get("yes_sub_title")
+            or market.get("yes_subtitle")
+            or market.get("subtitle")
+            or market.get("sub_title")
+        ),
+        "yes_bid": number(market.get("yes_bid_dollars")),
+        "yes_ask": number(market.get("yes_ask_dollars")),
+        "no_bid": number(market.get("no_bid_dollars")),
+        "no_ask": number(market.get("no_ask_dollars")),
+        "last": number(market.get("last_price_dollars")),
+        "volume": number(market.get("volume_fp")),
+        "volume_24h": number(market.get("volume_24h_fp")),
+        "open_interest": number(market.get("open_interest_fp")),
+        "close_time": market.get("close_time"),
+    }
+
+
 def compact_cfb_line_event(event, markets):
-    team, opponent, identity_source = infer_event_teams(event, markets)
+    winner_markets = [
+        market for market in (markets or [])
+        if is_cfb_winner_market(market)
+    ]
+    team, opponent, identity_source = infer_event_teams(event, winner_markets)
     return {
         "event_ticker": event.get("event_ticker"),
-        "title": event.get("title"),
+        "matchup": event.get("title"),
         "team": team,
         "opponent": opponent,
         "identity_source": identity_source,
-        "markets": [compact_market(market) for market in markets],
+        "markets": [
+            compact_cfb_line_market(market)
+            for market in winner_markets
+        ],
     }
 
 
@@ -5448,15 +5487,27 @@ def cfb_lines():
     try:
         events = discover_cfb_events_for_date(game_date)
         board = []
+        winner_market_count = 0
+
         for event in events:
             markets = get_event_markets(event.get("event_ticker"))
-            board.append(compact_cfb_line_event(event, markets))
+            compact_event = compact_cfb_line_event(event, markets)
+
+            # Exclude any event that does not actually contain a CFB
+            # game-winner contract. This keeps the Custom GPT response
+            # small and prevents spread/total markets from leaking in.
+            if not compact_event.get("markets"):
+                continue
+
+            winner_market_count += len(compact_event["markets"])
+            board.append(compact_event)
 
         return jsonify(
             success=True,
             read_only_kalshi=True,
             date=game_date,
             event_count=len(board),
+            winner_market_count=winner_market_count,
             events=board,
         )
     except requests.RequestException as e:
@@ -7118,3 +7169,4 @@ def walk_forward_elo_model():
             success=False,
             error=str(e)
         ), 502
+
