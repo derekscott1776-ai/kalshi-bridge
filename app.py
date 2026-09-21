@@ -2818,19 +2818,12 @@ def discover_cfbd_game(
     candidates = []
 
     for game in games:
-        pair = game_pair_score(
-            game,
-            team,
-            opponent
-        )
-
-        if (
-            pair["team_match"] < 0.65
-            or
-            pair["opponent_match"] < 0.65
-        ):
-            continue
-
+        # Date-filter BEFORE fuzzy team-name matching. A full CFBD season can
+        # contain well over a thousand games; running difflib SequenceMatcher
+        # against every game for every Kalshi event is unnecessarily expensive
+        # and can exceed the web worker timeout. Only games on the requested
+        # UTC date (plus/minus one day for US-local kickoff conversion) can be
+        # valid candidates, so discard the rest first.
         start_dt = (
             parse_iso_datetime(
                 game.get(
@@ -2852,6 +2845,19 @@ def discover_cfbd_game(
         # UTC date can differ from
         # the US local game date by one day.
         if date_difference > 1:
+            continue
+
+        pair = game_pair_score(
+            game,
+            team,
+            opponent
+        )
+
+        if (
+            pair["team_match"] < 0.65
+            or
+            pair["opponent_match"] < 0.65
+        ):
             continue
 
         adjusted_score = (
