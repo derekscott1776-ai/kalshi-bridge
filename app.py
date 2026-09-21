@@ -5,6 +5,7 @@ import re
 import requests
 import psycopg
 import uuid
+import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 from decimal import Decimal, ROUND_CEILING
@@ -5465,19 +5466,21 @@ def cfb_lines():
 @app.get("/scan-board")
 def scan_board():
     """
-    Full-board CFB winner scanner for one date.
+    Start a full-board CFB winner scan and return immediately.
 
-    Portfolio controls are loaded from PostgreSQL at run time. The endpoint
-    reads Kalshi/CFBD data and writes analytics history only; it never places
-    or modifies an exchange order.
+    The expensive board analysis runs in a background thread so the HTTP
+    request is not held open long enough to hit Gunicorn's request timeout.
+    Progress and final persistence state can be read from PostgreSQL through
+    /scan-board/status?scan_id=<id> and /db/latest-scan.
+
+    Kalshi access remains read-only; this endpoint only writes analytics
+    history to PostgreSQL.
     """
     game_date = request.args.get("date", "").strip()
     try:
         datetime.strptime(game_date, "%Y-%m-%d")
     except ValueError:
         return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
-
-    scan_record = None
 
     try:
         settings = scanner_settings()
@@ -5487,21 +5490,45 @@ def scan_board():
             raise RuntimeError("Database setting max_open_risk_dollars must be greater than 0.")
 
         scan_record = create_board_scan_record(game_date, settings)
+
+        worker = threading.Thread(
+            target=run_board_scan_background,
+            args=(scan_record, game_date, settings),
+            name=f"cfb-scan-{scan_record['scan_id']}",
+            daemon=True,
+        )
+        worker.start()
+
+        return jsonify(
+            success=True,
+            accepted=True,
+            read_only_kalshi=True,
+            date=game_date,
+            scan={
+                "id": scan_record["scan_id"],
+                "scan_uuid": scan_record["scan_uuid"],
+                "status": "RUNNING",
+            },
+            status_endpoint=f"/scan-board/status?scan_id={scan_record['scan_id']}",
+            latest_scan_endpoint="/db/latest-scan",
+            message="Full-board scan started in the background.",
+        ), 202
+
+    except Exception as e:
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+
+
+def run_board_scan_background(scan_record, game_date, settings):
+    """Execute one complete board scan outside the request/response lifetime."""
+    try:
         events = discover_cfb_events_for_date(game_date)
 
         if not events:
             mark_scan_failed(scan_record["scan_id"], "No Kalshi CFB winner events found for requested date.")
-            return jsonify(
-                success=False,
-                found=False,
-                date=game_date,
-                scan=scan_record,
-                message="No Kalshi CFB winner events found for requested date.",
-            ), 404
+            return
 
-        # Fetch the CFBD season only once for the entire board. The previous
-        # implementation called /games separately for every matchup, which
-        # caused Gunicorn to kill the request on large Saturday slates.
+        # Fetch the CFBD season once for the entire board. discover_cfbd_game
+        # date-filters this shared list before doing fuzzy team-name matching.
         cfbd_games = cfbd_get(
             "/games",
             params={
@@ -5510,12 +5537,9 @@ def scan_board():
             },
         )
 
-        # Analyze independent games concurrently. Each event needs its own
-        # Kalshi market/order-book reads, and doing those serially can exceed
-        # Gunicorn's request timeout on a full Saturday board even after CFBD
-        # matching has been optimized. The shared CFBD season list is read-only.
-        # Keep the worker pool modest so we reduce wall-clock time without
-        # creating an unnecessarily aggressive burst against Kalshi.
+        # Independent games can be analyzed concurrently. The web request has
+        # already returned, so a slow Kalshi order-book response can no longer
+        # trigger Gunicorn's request timeout for the initiating browser call.
         board_games = []
         max_workers = min(8, max(1, len(events)))
 
@@ -5556,7 +5580,6 @@ def scan_board():
             settings["max_open_risk_dollars"],
         )
 
-        # Rank final BUYs first by net edge/ROI. PASS games follow.
         ranked_games = sorted(
             board_games,
             key=lambda game: (
@@ -5573,64 +5596,103 @@ def scan_board():
             reverse=True,
         )
 
-        persisted = persist_board_scan_results(
+        persist_board_scan_results(
             scan_record["scan_id"],
             game_date,
             ranked_games,
             allocation,
         )
 
-        results = [
-            public_board_game(
-                game,
-                allocation["selected_by_event"].get(game.get("event_ticker")),
-            )
-            for game in ranked_games
-        ]
-        buys = [
-            result for result in results
-            if str((result.get("trade_decision") or {}).get("action", "")).startswith("BUY ")
-        ]
+    except Exception as e:
+        mark_scan_failed(scan_record["scan_id"], e)
+
+
+@app.get("/scan-board/status")
+def scan_board_status():
+    """Return PostgreSQL-backed status/results for one background board scan."""
+    raw_scan_id = request.args.get("scan_id", "").strip()
+    try:
+        scan_id = int(raw_scan_id)
+        if scan_id <= 0:
+            raise ValueError
+    except ValueError:
+        return jsonify(success=False, error="scan_id must be a positive integer"), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id, scan_uuid, scan_date, model_version,
+                        home_field_elo, elo_scale,
+                        markets_discovered, markets_analyzed,
+                        buy_recommendations, pass_recommendations,
+                        status, error_message, started_at, completed_at
+                    FROM scans
+                    WHERE id = %s
+                    """,
+                    (scan_id,),
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    return jsonify(success=True, found=False, scan_id=scan_id), 404
+
+                cur.execute(
+                    """
+                    SELECT
+                        ticker, side, decision, fair_probability, ask_price,
+                        net_edge, net_roi, recommended_position_dollars,
+                        recommended_contracts, recommendation_rank, created_at
+                    FROM recommendations
+                    WHERE scan_id = %s
+                    ORDER BY recommendation_rank NULLS LAST, id
+                    """,
+                    (scan_id,),
+                )
+                recs = cur.fetchall()
 
         return jsonify(
             success=True,
             found=True,
             read_only_kalshi=True,
-            persistence_verified_by_insert=True,
-            date=game_date,
-            model_version=LIVE_MODEL_VERSION,
-            live_home_field_elo=LIVE_HOME_FIELD_ELO,
-            live_elo_scale=LIVE_ELO_SCALE,
-            settings=settings,
-            portfolio={
-                "max_open_risk_dollars": allocation["max_open_risk_dollars"],
-                "allocated_risk_dollars": allocation["allocated_risk_dollars"],
-                "remaining_risk_dollars": allocation["remaining_risk_dollars"],
-            },
             scan={
-                "id": scan_record["scan_id"],
-                "scan_uuid": scan_record["scan_uuid"],
-                "status": "COMPLETED",
-                "events_discovered": len(events),
-                "events_analyzed": sum(1 for game in board_games if game.get("analyzed")),
-                "recommendations_saved": len(persisted),
-                "buy_games": len(buys),
+                "id": row[0],
+                "scan_uuid": str(row[1]),
+                "scan_date": row[2].isoformat() if row[2] else None,
+                "model_version": row[3],
+                "home_field_elo": float(row[4]) if row[4] is not None else None,
+                "elo_scale": float(row[5]) if row[5] is not None else None,
+                "markets_discovered": row[6],
+                "markets_analyzed": row[7],
+                "buy_recommendations": row[8],
+                "pass_recommendations": row[9],
+                "status": row[10],
+                "error_message": row[11],
+                "started_at": row[12].isoformat() if row[12] else None,
+                "completed_at": row[13].isoformat() if row[13] else None,
             },
-            ranked_buys=buys,
-            board=results,
+            recommendations=[
+                {
+                    "ticker": r[0],
+                    "side": r[1],
+                    "decision": r[2],
+                    "fair_probability": float(r[3]) if r[3] is not None else None,
+                    "ask_price": float(r[4]) if r[4] is not None else None,
+                    "net_edge": float(r[5]) if r[5] is not None else None,
+                    "net_roi": float(r[6]) if r[6] is not None else None,
+                    "recommended_position_dollars": float(r[7]) if r[7] is not None else None,
+                    "recommended_contracts": float(r[8]) if r[8] is not None else None,
+                    "recommendation_rank": r[9],
+                    "created_at": r[10].isoformat() if r[10] else None,
+                }
+                for r in recs
+            ],
+            recommendation_count=len(recs),
         )
 
-    except RuntimeError as e:
-        if scan_record:
-            mark_scan_failed(scan_record["scan_id"], e)
-        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
-    except requests.RequestException as e:
-        if scan_record:
-            mark_scan_failed(scan_record["scan_id"], e)
-        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 502
     except Exception as e:
-        if scan_record:
-            mark_scan_failed(scan_record["scan_id"], e)
         return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
 
 
