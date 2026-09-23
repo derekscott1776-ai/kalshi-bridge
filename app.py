@@ -4951,59 +4951,6 @@ def create_board_scan_record(game_date, settings):
     return {"scan_id": scan_id, "scan_uuid": str(scan_uuid)}
 
 
-
-def discover_cfb_winner_markets_fast(game_date):
-    """
-    Fast read-only CFB winner-market discovery for /cfb-lines.
-
-    Query Kalshi's markets endpoint directly instead of paging through every
-    KXNCAAFGAME event and then making one additional markets request per event.
-    This keeps the ChatGPT-facing endpoint inside the normal web-request
-    timeout while leaving the Milestone 3 background scanner unchanged.
-    """
-    date_obj = datetime.strptime(game_date, "%Y-%m-%d")
-    date_code = date_obj.strftime("%y%b%d").upper()
-    cursor = None
-    markets = []
-    seen = set()
-
-    for _ in range(12):
-        params = {
-            "series_ticker": "KXNCAAFGAME",
-            "limit": 1000,
-        }
-        if cursor:
-            params["cursor"] = cursor
-
-        data = kalshi_get("/markets", params=params)
-
-        for market in data.get("markets", []):
-            ticker = str(market.get("ticker") or "").upper()
-            event_ticker = str(market.get("event_ticker") or "").upper()
-
-            if date_code not in ticker and date_code not in event_ticker:
-                continue
-
-            if not (
-                ticker.startswith("KXNCAAFGAME-")
-                or event_ticker.startswith("KXNCAAFGAME-")
-            ):
-                continue
-
-            if ticker in seen:
-                continue
-
-            seen.add(ticker)
-            markets.append(market)
-
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-
-    markets.sort(key=lambda market: str(market.get("ticker") or ""))
-    return markets
-
-
 def discover_cfb_events_for_date(game_date):
     """Return all KXNCAAFGAME events whose ticker contains the date code."""
     date_obj = datetime.strptime(game_date, "%Y-%m-%d")
@@ -5111,54 +5058,15 @@ def infer_event_teams(event, markets):
     return None, None, "unresolved"
 
 
-def is_cfb_winner_market(market):
-    """Return True only for college-football game-winner contracts."""
-    ticker = str(market.get("ticker") or "").upper()
-    event_ticker = str(market.get("event_ticker") or "").upper()
-    return (
-        ticker.startswith("KXNCAAFGAME-")
-        or event_ticker.startswith("KXNCAAFGAME-")
-    )
-
-
-def compact_cfb_line_market(market):
-    """Small public payload for /cfb-lines and Custom GPT actions."""
-    return {
-        "ticker": market.get("ticker"),
-        "outcome": (
-            market.get("yes_sub_title")
-            or market.get("yes_subtitle")
-            or market.get("subtitle")
-            or market.get("sub_title")
-        ),
-        "yes_bid": number(market.get("yes_bid_dollars")),
-        "yes_ask": number(market.get("yes_ask_dollars")),
-        "no_bid": number(market.get("no_bid_dollars")),
-        "no_ask": number(market.get("no_ask_dollars")),
-        "last": number(market.get("last_price_dollars")),
-        "volume": number(market.get("volume_fp")),
-        "volume_24h": number(market.get("volume_24h_fp")),
-        "open_interest": number(market.get("open_interest_fp")),
-        "close_time": market.get("close_time"),
-    }
-
-
 def compact_cfb_line_event(event, markets):
-    winner_markets = [
-        market for market in (markets or [])
-        if is_cfb_winner_market(market)
-    ]
-    team, opponent, identity_source = infer_event_teams(event, winner_markets)
+    team, opponent, identity_source = infer_event_teams(event, markets)
     return {
         "event_ticker": event.get("event_ticker"),
-        "matchup": event.get("title"),
+        "title": event.get("title"),
         "team": team,
         "opponent": opponent,
         "identity_source": identity_source,
-        "markets": [
-            compact_cfb_line_market(market)
-            for market in winner_markets
-        ],
+        "markets": [compact_market(market) for market in markets],
     }
 
 
@@ -5530,58 +5438,29 @@ def public_board_game(game, final_decision):
 
 @app.get("/cfb-lines")
 def cfb_lines():
-    """
-    Fast, compact, read-only Kalshi CFB winner board for one date.
-
-    Returns one flat object per winner contract and performs no database write.
-    """
+    """Read-only current Kalshi CFB winner board for one date; no DB write."""
     game_date = request.args.get("date", "").strip()
-
     try:
         datetime.strptime(game_date, "%Y-%m-%d")
     except ValueError:
-        return jsonify(
-            success=False,
-            error="date must use YYYY-MM-DD format",
-        ), 400
+        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
 
     try:
-        markets = discover_cfb_winner_markets_fast(game_date)
-
-        compact_markets = []
-        for market in markets:
-            game = (
-                market.get("title")
-                or market.get("subtitle")
-                or market.get("event_ticker")
-            )
-
-            compact_markets.append({
-                "game": game,
-                "ticker": market.get("ticker"),
-                "yes_bid": number(market.get("yes_bid_dollars")),
-                "yes_ask": number(market.get("yes_ask_dollars")),
-                "no_bid": number(market.get("no_bid_dollars")),
-                "no_ask": number(market.get("no_ask_dollars")),
-                "last": number(market.get("last_price_dollars")),
-                "volume": number(market.get("volume_fp")),
-                "open_interest": number(market.get("open_interest_fp")),
-            })
+        events = discover_cfb_events_for_date(game_date)
+        board = []
+        for event in events:
+            markets = get_event_markets(event.get("event_ticker"))
+            board.append(compact_cfb_line_event(event, markets))
 
         return jsonify(
             success=True,
             read_only_kalshi=True,
             date=game_date,
-            market_count=len(compact_markets),
-            markets=compact_markets,
+            event_count=len(board),
+            events=board,
         )
-
     except requests.RequestException as e:
-        return jsonify(
-            success=False,
-            error_type=type(e).__name__,
-            error=str(e),
-        ), 502
+        return jsonify(success=False, error=str(e)), 502
 
 
 @app.get("/scan-board")
@@ -5813,6 +5692,544 @@ def scan_board_status():
             recommendation_count=len(recs),
         )
 
+    except Exception as e:
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+
+
+
+# ============================================================
+# MILESTONE 5: RECOMMENDATION TRACKING / CLV / SETTLEMENT
+#
+# This layer extends the existing analytics persistence without
+# changing scanner behavior. It NEVER places, modifies, or cancels
+# Kalshi orders. It records later market snapshots for prior BUY
+# recommendations and reports recommendation-level CLV/performance.
+#
+# Important distinction:
+# - recommendations = model history / paper recommendation record
+# - positions       = actual trades only (left untouched here)
+# ============================================================
+
+TRACKING_CLOSED_STATUSES = {
+    "closed", "finalized", "settled", "determined", "resolved"
+}
+TRACKING_SETTLED_STATUSES = {
+    "finalized", "settled", "determined", "resolved"
+}
+
+
+def get_kalshi_market(ticker):
+    """Fetch one Kalshi market using the existing read-only GET client."""
+    data = kalshi_get(f"/markets/{ticker}")
+    market = data.get("market") if isinstance(data, dict) else None
+    if market is None and isinstance(data, dict) and data.get("ticker"):
+        market = data
+    if not isinstance(market, dict):
+        raise RuntimeError(f"Kalshi market not found for ticker {ticker}.")
+    return market
+
+
+def tracking_market_status(market):
+    return str(market.get("status") or "").strip().lower()
+
+
+def tracking_market_result(market):
+    """Normalize Kalshi's settled binary result when it is available."""
+    raw = market.get("result")
+    if raw is None:
+        raw = market.get("settlement_value")
+    if raw is None:
+        raw = market.get("settlement_value_dollars")
+
+    text = str(raw or "").strip().lower()
+    if text in {"yes", "y", "1", "1.0", "1.00", "$1.00"}:
+        return "YES"
+    if text in {"no", "n", "0", "0.0", "0.00", "$0.00"}:
+        return "NO"
+    if text in {"void", "cancelled", "canceled"}:
+        return "VOID"
+    return None
+
+
+def tracking_side_prices(market, side):
+    """Return bid/ask for the recommendation's purchased YES or NO side."""
+    side = str(side or "YES").upper()
+    if side == "NO":
+        bid = number(market.get("no_bid_dollars"))
+        ask = number(market.get("no_ask_dollars"))
+        if bid is None:
+            yes_ask = number(market.get("yes_ask_dollars"))
+            bid = 1.0 - yes_ask if yes_ask is not None else None
+        if ask is None:
+            yes_bid = number(market.get("yes_bid_dollars"))
+            ask = 1.0 - yes_bid if yes_bid is not None else None
+    else:
+        bid = number(market.get("yes_bid_dollars"))
+        ask = number(market.get("yes_ask_dollars"))
+        if bid is None:
+            no_ask = number(market.get("no_ask_dollars"))
+            bid = 1.0 - no_ask if no_ask is not None else None
+        if ask is None:
+            no_bid = number(market.get("no_bid_dollars"))
+            ask = 1.0 - no_bid if no_bid is not None else None
+
+    raw_last = number(market.get("last_price_dollars"))
+    side_last = (1.0 - raw_last) if side == "NO" and raw_last is not None else raw_last
+
+    return {
+        "bid_price": bid,
+        "ask_price": ask,
+        "last_price": side_last,
+        "volume": number(market.get("volume_fp")),
+        "volume_24h": number(market.get("volume_24h_fp")),
+        "open_interest": number(market.get("open_interest_fp")),
+    }
+
+
+def tracking_snapshot_exists(cur, recommendation_id, snapshot_type):
+    cur.execute(
+        """
+        SELECT id
+        FROM market_snapshots
+        WHERE recommendation_id = %s
+          AND snapshot_type = %s
+        ORDER BY captured_at DESC
+        LIMIT 1
+        """,
+        (recommendation_id, snapshot_type),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def insert_tracking_snapshot(cur, recommendation_id, snapshot_type, prices):
+    """Insert one canonical CLOSE or SETTLEMENT snapshot if absent."""
+    existing_id = tracking_snapshot_exists(
+        cur, recommendation_id, snapshot_type
+    )
+    if existing_id:
+        return {"inserted": False, "snapshot_id": existing_id}
+
+    cur.execute(
+        """
+        INSERT INTO market_snapshots (
+            recommendation_id, snapshot_type, bid_price, ask_price,
+            last_price, volume, volume_24h, open_interest
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            recommendation_id,
+            snapshot_type,
+            prices.get("bid_price"),
+            prices.get("ask_price"),
+            prices.get("last_price"),
+            prices.get("volume"),
+            prices.get("volume_24h"),
+            prices.get("open_interest"),
+        ),
+    )
+    return {"inserted": True, "snapshot_id": cur.fetchone()[0]}
+
+
+def tracking_recommendations(scan_id=None, game_date=None, buys_only=True):
+    clauses = []
+    params = []
+
+    if buys_only:
+        clauses.append("r.decision IN ('BUY YES', 'BUY NO')")
+    if scan_id is not None:
+        clauses.append("r.scan_id = %s")
+        params.append(scan_id)
+    if game_date is not None:
+        clauses.append("r.game_date = %s")
+        params.append(game_date)
+
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    r.id, r.scan_id, r.game_date, r.team, r.opponent,
+                    r.event_ticker, r.ticker, r.side, r.decision,
+                    r.fair_probability, r.weighted_fill_price,
+                    r.all_in_cost_per_contract, r.all_in_cost,
+                    r.recommended_contracts, r.recommended_position_dollars,
+                    r.net_edge, r.net_roi, r.created_at
+                FROM recommendations r
+                {where_sql}
+                ORDER BY r.game_date DESC NULLS LAST, r.id DESC
+                """,
+                tuple(params),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "recommendation_id": row[0],
+            "scan_id": row[1],
+            "game_date": row[2],
+            "team": row[3],
+            "opponent": row[4],
+            "event_ticker": row[5],
+            "ticker": row[6],
+            "side": row[7],
+            "decision": row[8],
+            "fair_probability": number(row[9]),
+            "weighted_fill_price": number(row[10]),
+            "all_in_cost_per_contract": number(row[11]),
+            "all_in_cost": number(row[12]),
+            "recommended_contracts": number(row[13]),
+            "recommended_position_dollars": number(row[14]),
+            "net_edge": number(row[15]),
+            "net_roi": number(row[16]),
+            "created_at": row[17],
+        }
+        for row in rows
+    ]
+
+
+def tracking_scope_from_request():
+    raw_scan_id = request.args.get("scan_id", "").strip()
+    raw_date = request.args.get("date", "").strip()
+
+    scan_id = None
+    game_date = None
+
+    if raw_scan_id:
+        try:
+            scan_id = int(raw_scan_id)
+            if scan_id <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("scan_id must be a positive integer")
+
+    if raw_date:
+        try:
+            datetime.strptime(raw_date, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("date must use YYYY-MM-DD format")
+        game_date = raw_date
+
+    if scan_id is None and game_date is None:
+        raise ValueError("Provide scan_id or date to limit the tracking run.")
+
+    return scan_id, game_date
+
+
+def recommendation_outcome(side, market_result):
+    if market_result == "VOID":
+        return "VOID"
+    if market_result not in {"YES", "NO"}:
+        return None
+    return "WIN" if str(side).upper() == market_result else "LOSS"
+
+
+def snapshot_reference_price(snapshot):
+    """Prefer last trade for closing-line analysis, then midpoint, then ask/bid."""
+    if not snapshot:
+        return None
+    last = number(snapshot.get("last_price"))
+    if last is not None:
+        return last
+    bid = number(snapshot.get("bid_price"))
+    ask = number(snapshot.get("ask_price"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    return ask if ask is not None else bid
+
+
+def recommendation_snapshots(recommendation_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT snapshot_type, bid_price, ask_price, last_price,
+                       volume, volume_24h, open_interest, captured_at
+                FROM market_snapshots
+                WHERE recommendation_id = %s
+                ORDER BY captured_at ASC, id ASC
+                """,
+                (recommendation_id,),
+            )
+            rows = cur.fetchall()
+
+    snapshots = {}
+    for row in rows:
+        snapshots[row[0]] = {
+            "snapshot_type": row[0],
+            "bid_price": number(row[1]),
+            "ask_price": number(row[2]),
+            "last_price": number(row[3]),
+            "volume": number(row[4]),
+            "volume_24h": number(row[5]),
+            "open_interest": number(row[6]),
+            "captured_at": row[7].isoformat() if row[7] else None,
+        }
+    return snapshots
+
+
+def recommendation_performance_payload(rec, live_market=None):
+    snapshots = recommendation_snapshots(rec["recommendation_id"])
+    entry = snapshots.get("ENTRY")
+    close = snapshots.get("CLOSE")
+    settlement = snapshots.get("SETTLEMENT")
+
+    close_reference = snapshot_reference_price(close)
+    entry_fill = rec.get("weighted_fill_price")
+    if entry_fill is None:
+        entry_fill = snapshot_reference_price(entry)
+
+    clv_price = (
+        close_reference - entry_fill
+        if close_reference is not None and entry_fill is not None
+        else None
+    )
+    model_vs_close = (
+        rec.get("fair_probability") - close_reference
+        if rec.get("fair_probability") is not None and close_reference is not None
+        else None
+    )
+
+    market_result = tracking_market_result(live_market or {})
+    outcome = recommendation_outcome(rec.get("side"), market_result)
+
+    contracts = rec.get("recommended_contracts")
+    all_in_cost = rec.get("all_in_cost")
+    hypothetical_payout = None
+    hypothetical_profit_loss = None
+    hypothetical_roi = None
+
+    if outcome in {"WIN", "LOSS"} and contracts is not None and all_in_cost is not None:
+        hypothetical_payout = contracts if outcome == "WIN" else 0.0
+        hypothetical_profit_loss = hypothetical_payout - all_in_cost
+        if all_in_cost > 0:
+            hypothetical_roi = hypothetical_profit_loss / all_in_cost
+
+    return {
+        "recommendation_id": rec["recommendation_id"],
+        "scan_id": rec["scan_id"],
+        "game_date": rec["game_date"].isoformat() if rec.get("game_date") else None,
+        "team": rec["team"],
+        "opponent": rec["opponent"],
+        "ticker": rec["ticker"],
+        "side": rec["side"],
+        "decision": rec["decision"],
+        "fair_probability": rec["fair_probability"],
+        "entry_weighted_fill_price": entry_fill,
+        "entry_all_in_cost_per_contract": rec.get("all_in_cost_per_contract"),
+        "closing_reference_price": close_reference,
+        "clv_price_points": round(clv_price, 8) if clv_price is not None else None,
+        "clv_percentage_points": round(clv_price * 100.0, 4) if clv_price is not None else None,
+        "model_probability_minus_close": round(model_vs_close, 8) if model_vs_close is not None else None,
+        "market_result": market_result,
+        "recommendation_outcome": outcome,
+        "recommended_contracts": contracts,
+        "recommended_all_in_cost": all_in_cost,
+        "hypothetical_payout": round(hypothetical_payout, 6) if hypothetical_payout is not None else None,
+        "hypothetical_profit_loss": round(hypothetical_profit_loss, 6) if hypothetical_profit_loss is not None else None,
+        "hypothetical_roi": round(hypothetical_roi, 8) if hypothetical_roi is not None else None,
+        "snapshots": snapshots,
+        "note": (
+            "Recommendation performance is hypothetical unless a row exists in positions. "
+            "The positions table remains reserved for actual trades."
+        ),
+    }
+
+
+@app.get("/tracking/capture")
+def tracking_capture():
+    """
+    Capture canonical CLOSE/SETTLEMENT snapshots for prior BUY recommendations.
+
+    This endpoint performs read-only Kalshi GET requests and writes only to the
+    analytics PostgreSQL database. It does not place or manage trades.
+    """
+    try:
+        scan_id, game_date = tracking_scope_from_request()
+        recs = tracking_recommendations(scan_id=scan_id, game_date=game_date, buys_only=True)
+
+        results = []
+        inserted_close = 0
+        inserted_settlement = 0
+        still_open = 0
+        errors = 0
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                for rec in recs:
+                    try:
+                        market = get_kalshi_market(rec["ticker"])
+                        status = tracking_market_status(market)
+                        result = tracking_market_result(market)
+                        prices = tracking_side_prices(market, rec["side"])
+                        close_result = None
+                        settlement_result = None
+
+                        # A true CLOSE snapshot must be observed after trading
+                        # closes but before a binary settlement result is known.
+                        # Never mislabel a settlement-state quote as the closing
+                        # line; that would contaminate CLV measurement.
+                        if status in TRACKING_CLOSED_STATUSES and result is None:
+                            close_result = insert_tracking_snapshot(
+                                cur, rec["recommendation_id"], "CLOSE", prices
+                            )
+                            if close_result["inserted"]:
+                                inserted_close += 1
+                        elif result is None:
+                            still_open += 1
+
+                        if result is not None or status in TRACKING_SETTLED_STATUSES:
+                            settlement_result = insert_tracking_snapshot(
+                                cur, rec["recommendation_id"], "SETTLEMENT", prices
+                            )
+                            if settlement_result["inserted"]:
+                                inserted_settlement += 1
+
+                        results.append({
+                            "recommendation_id": rec["recommendation_id"],
+                            "ticker": rec["ticker"],
+                            "side": rec["side"],
+                            "kalshi_status": status or None,
+                            "kalshi_result": result,
+                            "close_snapshot": close_result,
+                            "settlement_snapshot": settlement_result,
+                        })
+                    except Exception as e:
+                        errors += 1
+                        results.append({
+                            "recommendation_id": rec["recommendation_id"],
+                            "ticker": rec["ticker"],
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                        })
+
+            conn.commit()
+
+        return jsonify(
+            success=True,
+            read_only_kalshi=True,
+            analytics_database_write=True,
+            scope={"scan_id": scan_id, "date": game_date},
+            recommendations_checked=len(recs),
+            close_snapshots_inserted=inserted_close,
+            settlement_snapshots_inserted=inserted_settlement,
+            still_open=still_open,
+            errors=errors,
+            results=results,
+        )
+
+    except ValueError as e:
+        return jsonify(success=False, error=str(e)), 400
+    except Exception as e:
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+
+
+@app.get("/tracking/performance")
+def tracking_performance():
+    """Report CLV and hypothetical recommendation performance for one scan/date."""
+    try:
+        scan_id, game_date = tracking_scope_from_request()
+        recs = tracking_recommendations(scan_id=scan_id, game_date=game_date, buys_only=True)
+
+        rows = []
+        for rec in recs:
+            live_market = None
+            try:
+                live_market = get_kalshi_market(rec["ticker"])
+            except Exception:
+                # Historical snapshot reporting should remain available even
+                # if Kalshi is temporarily unavailable.
+                live_market = None
+            rows.append(recommendation_performance_payload(rec, live_market))
+
+        settled_rows = [r for r in rows if r.get("recommendation_outcome") in {"WIN", "LOSS"}]
+        wins = sum(1 for r in settled_rows if r["recommendation_outcome"] == "WIN")
+        losses = sum(1 for r in settled_rows if r["recommendation_outcome"] == "LOSS")
+        pnl_values = [r["hypothetical_profit_loss"] for r in settled_rows if r.get("hypothetical_profit_loss") is not None]
+        clv_values = [r["clv_price_points"] for r in rows if r.get("clv_price_points") is not None]
+
+        total_cost = sum(
+            number(r.get("recommended_all_in_cost")) or 0.0
+            for r in settled_rows
+            if r.get("hypothetical_profit_loss") is not None
+        )
+        total_pnl = sum(pnl_values) if pnl_values else 0.0
+
+        return jsonify(
+            success=True,
+            read_only_kalshi=True,
+            scope={"scan_id": scan_id, "date": game_date},
+            summary={
+                "buy_recommendations": len(rows),
+                "settled_recommendations": len(settled_rows),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(wins / len(settled_rows), 6) if settled_rows else None,
+                "average_clv_price_points": round(sum(clv_values) / len(clv_values), 8) if clv_values else None,
+                "average_clv_percentage_points": round((sum(clv_values) / len(clv_values)) * 100.0, 4) if clv_values else None,
+                "hypothetical_total_cost": round(total_cost, 6),
+                "hypothetical_profit_loss": round(total_pnl, 6),
+                "hypothetical_roi": round(total_pnl / total_cost, 8) if total_cost > 0 else None,
+            },
+            recommendations=rows,
+            methodology={
+                "clv": "Closing reference price minus recommendation weighted fill price. Positive is favorable for a BUY.",
+                "model_vs_close": "Model fair probability minus closing reference price.",
+                "pnl": "Hypothetical recommendation P/L only; actual trades belong in positions.",
+            },
+        )
+
+    except ValueError as e:
+        return jsonify(success=False, error=str(e)), 400
+    except Exception as e:
+        return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
+
+
+@app.get("/tracking/summary")
+def tracking_summary():
+    """Small database-only status view for Milestone 5 tracking coverage."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM recommendations
+                    WHERE decision IN ('BUY YES', 'BUY NO')
+                    """
+                )
+                buy_recommendations = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT snapshot_type, COUNT(*)
+                    FROM market_snapshots ms
+                    JOIN recommendations r ON r.id = ms.recommendation_id
+                    WHERE r.decision IN ('BUY YES', 'BUY NO')
+                    GROUP BY snapshot_type
+                    """
+                )
+                snapshot_counts = {row[0]: row[1] for row in cur.fetchall()}
+
+                cur.execute("SELECT COUNT(*) FROM positions")
+                actual_positions = cur.fetchone()[0]
+
+        return jsonify(
+            success=True,
+            read_only_kalshi=True,
+            buy_recommendations=buy_recommendations,
+            snapshots={
+                "ENTRY": snapshot_counts.get("ENTRY", 0),
+                "CLOSE": snapshot_counts.get("CLOSE", 0),
+                "SETTLEMENT": snapshot_counts.get("SETTLEMENT", 0),
+            },
+            actual_positions=actual_positions,
+            positions_note="Positions are actual trades only; recommendations are not auto-converted into positions.",
+        )
     except Exception as e:
         return jsonify(success=False, error_type=type(e).__name__, error=str(e)), 500
 
