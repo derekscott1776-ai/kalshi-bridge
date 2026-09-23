@@ -7657,3 +7657,365 @@ def walk_forward_elo_model():
             error=str(e)
         ), 502
 
+# ============================================================
+# MILESTONE 5: SPORTSBOOK CONSENSUS / THE ODDS API
+#
+# Read-only sportsbook reference layer. This integration does not
+# place bets and does not change the existing Kalshi scan decision
+# engine yet. It provides a separately testable no-vig consensus
+# feed that can be wired into model-disagreement safeguards after
+# the API connection and team matching are verified in production.
+#
+# Required Render environment variable:
+#   ODDS_API_KEY=<The Odds API key>
+# ============================================================
+
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+ODDS_API_CFB_SPORT_KEY = "americanfootball_ncaaf"
+ODDS_API_REGION = "us"
+ODDS_API_MARKET = "h2h"
+ODDS_API_TIMEOUT_SECONDS = 20
+ODDS_API_LOCAL_TIMEZONE = "America/Chicago"
+
+
+def odds_api_key():
+    key = os.environ.get("ODDS_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "ODDS_API_KEY is not configured in the Render environment."
+        )
+    return key
+
+
+def odds_api_get(path, params=None):
+    """Read-only GET helper for The Odds API v4."""
+    query = dict(params or {})
+    query["apiKey"] = odds_api_key()
+
+    response = requests.get(
+        f"{ODDS_API_BASE_URL}{path}",
+        params=query,
+        timeout=ODDS_API_TIMEOUT_SECONDS,
+    )
+
+    quota = {
+        "requests_remaining": response.headers.get("x-requests-remaining"),
+        "requests_used": response.headers.get("x-requests-used"),
+        "requests_last": response.headers.get("x-requests-last"),
+    }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if not response.ok:
+        detail = payload if payload is not None else response.text[:1000]
+        raise RuntimeError(
+            f"The Odds API returned HTTP {response.status_code}: {detail}"
+        )
+
+    return payload, quota
+
+
+def decimal_implied_probability(decimal_price):
+    price = number(decimal_price)
+    if price is None or price <= 1.0:
+        return None
+    return 1.0 / price
+
+
+def odds_event_local_date(event):
+    """Convert The Odds API UTC commence time to the scanner's Central date."""
+    raw = str(event.get("commence_time") or "").strip()
+    if not raw:
+        return None
+
+    try:
+        utc_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        from zoneinfo import ZoneInfo
+        return utc_dt.astimezone(ZoneInfo(ODDS_API_LOCAL_TIMEZONE)).date().isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def bookmaker_h2h_no_vig(bookmaker):
+    """Return one bookmaker's two-way moneyline as normalized probabilities."""
+    markets = bookmaker.get("markets") or []
+    h2h = next((m for m in markets if m.get("key") == "h2h"), None)
+    if not h2h:
+        return None
+
+    outcomes = h2h.get("outcomes") or []
+    if len(outcomes) != 2:
+        return None
+
+    raw = []
+    for outcome in outcomes:
+        name = str(outcome.get("name") or "").strip()
+        implied = decimal_implied_probability(outcome.get("price"))
+        if not name or implied is None:
+            return None
+        raw.append((name, implied, outcome.get("price")))
+
+    overround = sum(item[1] for item in raw)
+    if overround <= 0:
+        return None
+
+    return {
+        "bookmaker_key": bookmaker.get("key"),
+        "bookmaker": bookmaker.get("title"),
+        "last_update": bookmaker.get("last_update"),
+        "overround": round(overround, 6),
+        "hold_percent": round((overround - 1.0) * 100.0, 3),
+        "outcomes": [
+            {
+                "team": name,
+                "decimal_odds": price,
+                "raw_implied_probability": round(implied, 6),
+                "no_vig_probability": round(implied / overround, 6),
+            }
+            for name, implied, price in raw
+        ],
+    }
+
+
+def median_value(values):
+    values = sorted(float(v) for v in values)
+    if not values:
+        return None
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2.0
+
+
+def sportsbook_consensus_for_event(event):
+    """Build mean/median no-vig consensus from every valid two-way US book."""
+    books = []
+    by_team = {}
+
+    for bookmaker in event.get("bookmakers") or []:
+        book = bookmaker_h2h_no_vig(bookmaker)
+        if not book:
+            continue
+        books.append(book)
+        for outcome in book["outcomes"]:
+            by_team.setdefault(outcome["team"], []).append(
+                outcome["no_vig_probability"]
+            )
+
+    consensus = []
+    for team_name, probabilities in by_team.items():
+        if not probabilities:
+            continue
+        consensus.append({
+            "team": team_name,
+            "book_count": len(probabilities),
+            "mean_no_vig_probability": round(
+                sum(probabilities) / len(probabilities), 6
+            ),
+            "median_no_vig_probability": round(
+                median_value(probabilities), 6
+            ),
+            "min_no_vig_probability": round(min(probabilities), 6),
+            "max_no_vig_probability": round(max(probabilities), 6),
+        })
+
+    consensus.sort(
+        key=lambda row: row["mean_no_vig_probability"], reverse=True
+    )
+
+    return {
+        "event_id": event.get("id"),
+        "sport_key": event.get("sport_key"),
+        "commence_time": event.get("commence_time"),
+        "local_date": odds_event_local_date(event),
+        "home_team": event.get("home_team"),
+        "away_team": event.get("away_team"),
+        "bookmaker_count": len(books),
+        "consensus": consensus,
+        "bookmakers": books,
+    }
+
+
+def fetch_cfb_sportsbook_board(game_date=None):
+    """Fetch current/upcoming CFB moneylines once and optionally date-filter."""
+    params = {
+        "regions": ODDS_API_REGION,
+        "markets": ODDS_API_MARKET,
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    }
+
+    payload, quota = odds_api_get(
+        f"/sports/{ODDS_API_CFB_SPORT_KEY}/odds",
+        params=params,
+    )
+
+    if not isinstance(payload, list):
+        raise RuntimeError("The Odds API returned an unexpected CFB payload.")
+
+    events = payload
+    if game_date:
+        events = [
+            event for event in events
+            if odds_event_local_date(event) == game_date
+        ]
+
+    return events, quota
+
+
+def sportsbook_event_match_score(event, team, opponent):
+    """Score a two-team event against the requested matchup in either order."""
+    home = str(event.get("home_team") or "")
+    away = str(event.get("away_team") or "")
+
+    direct = (
+        similarity(home, team) + similarity(away, opponent)
+    ) / 2.0
+    reverse = (
+        similarity(home, opponent) + similarity(away, team)
+    ) / 2.0
+    return max(direct, reverse)
+
+
+def find_sportsbook_event(events, team, opponent, minimum_score=0.72):
+    scored = [
+        (sportsbook_event_match_score(event, team, opponent), event)
+        for event in events
+    ]
+    if not scored:
+        return None, 0.0
+
+    score, event = max(scored, key=lambda item: item[0])
+    if score < minimum_score:
+        return None, score
+    return event, score
+
+
+@app.get("/odds/health")
+def odds_health():
+    """Verify The Odds API key using the quota-free /sports endpoint."""
+    try:
+        sports, quota = odds_api_get("/sports")
+        cfb = next(
+            (
+                sport for sport in (sports or [])
+                if sport.get("key") == ODDS_API_CFB_SPORT_KEY
+            ),
+            None,
+        )
+        return jsonify(
+            success=True,
+            provider="The Odds API",
+            read_only=True,
+            api_key_configured=True,
+            cfb_sport_available=cfb is not None,
+            cfb_sport=cfb,
+            quota=quota,
+        )
+    except Exception as e:
+        return jsonify(
+            success=False,
+            provider="The Odds API",
+            read_only=True,
+            api_key_configured=bool(os.environ.get("ODDS_API_KEY", "").strip()),
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+
+@app.get("/odds/cfb")
+def odds_cfb():
+    """Return compact CFB sportsbook no-vig consensus for one Central date."""
+    game_date = request.args.get("date", "").strip()
+    if not game_date:
+        return jsonify(success=False, error="date is required (YYYY-MM-DD)"), 400
+
+    try:
+        datetime.strptime(game_date, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
+
+    try:
+        events, quota = fetch_cfb_sportsbook_board(game_date)
+        consensus = [sportsbook_consensus_for_event(event) for event in events]
+        return jsonify(
+            success=True,
+            provider="The Odds API",
+            read_only=True,
+            sport="college_football",
+            market="moneyline",
+            date=game_date,
+            timezone=ODDS_API_LOCAL_TIMEZONE,
+            event_count=len(consensus),
+            quota=quota,
+            events=consensus,
+        )
+    except Exception as e:
+        return jsonify(
+            success=False,
+            provider="The Odds API",
+            read_only=True,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
+
+@app.get("/odds/cfb/match")
+def odds_cfb_match():
+    """Return sportsbook consensus for one requested CFB matchup."""
+    team = request.args.get("team", "").strip()
+    opponent = request.args.get("opponent", "").strip()
+    game_date = request.args.get("date", "").strip()
+
+    if not team or not opponent or not game_date:
+        return jsonify(
+            success=False,
+            error="team, opponent, and date are required",
+        ), 400
+
+    try:
+        datetime.strptime(game_date, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(success=False, error="date must use YYYY-MM-DD format"), 400
+
+    try:
+        events, quota = fetch_cfb_sportsbook_board(game_date)
+        event, match_score = find_sportsbook_event(events, team, opponent)
+
+        if event is None:
+            return jsonify(
+                success=True,
+                found=False,
+                read_only=True,
+                provider="The Odds API",
+                matchup=f"{team} vs {opponent}",
+                date=game_date,
+                best_match_score=round(match_score, 4),
+                event_count_checked=len(events),
+                quota=quota,
+                message="No sufficiently close sportsbook matchup was found.",
+            )
+
+        return jsonify(
+            success=True,
+            found=True,
+            read_only=True,
+            provider="The Odds API",
+            matchup=f"{team} vs {opponent}",
+            date=game_date,
+            match_score=round(match_score, 4),
+            quota=quota,
+            sportsbook=sportsbook_consensus_for_event(event),
+        )
+    except Exception as e:
+        return jsonify(
+            success=False,
+            provider="The Odds API",
+            read_only=True,
+            error_type=type(e).__name__,
+            error=str(e),
+        ), 500
+
